@@ -35,16 +35,29 @@ connection details, or wallets into source control. `wallet/` is ignored.
 | `RB_DB_USER` | Database username, required |
 | `RB_DB_PASSWORD` | Database password, required |
 | `RB_WALLET_DIR` | Wallet directory containing the auto-login wallet, required |
-| `RB_HK_URL` | Source base URL; required for serve and rebuild |
+| `RB_HK_URL` | Source base URL; HTTPS required except HTTP to literal loopback IPs; required for serve and rebuild |
 | `RB_HK_TOKEN` | Source bearer token with read scope; required for serve and rebuild |
 | `RB_SEARCH_TOKEN` | Search bearer token; required for serve |
-| `RB_LISTEN_ADDR` | HTTP bind address, default port 8080 |
+| `RB_LISTEN_ADDR` | HTTP bind address, default IPv4 loopback on port 8080; non-loopback overrides require a protected proxy network |
 | `RB_SYNC_INTERVAL` | Poll interval as a Go duration; default 15s, range 1s–1h |
 
 The driver enables TLS with certificate verification. Keep the wallet readable
 only by the service account. Logs omit connection strings and upstream bodies.
 
 ## Search
+
+For remote access, a TLS-terminating reverse proxy is required. The backend
+serves plaintext HTTP and binds to IPv4 loopback by default. Keep it reachable
+only by the proxy, and expose only the proxy's HTTPS listener to clients;
+`RB_SEARCH_TOKEN` and returned content must never cross an untrusted plaintext
+network. `RB_LISTEN_ADDR` can override the binding for a proxy in a separate
+network namespace, provided firewall/network policy restricts backend access
+to that proxy. The override does not enable TLS on the backend.
+
+Source requests require HTTPS before a bearer token is attached. Plain HTTP
+is permitted only for literal loopback IPs, allowing local tests and tunnels;
+remote HTTP URLs, DNS hostnames over HTTP, and URL userinfo are rejected.
+Redirects are not followed, including with an injected HTTP client.
 
 `GET /v1/search?q=&model=&limit=` requires `Authorization: Bearer` with
 `RB_SEARCH_TOKEN`. `q` is 1–256 characters; `model` optionally selects

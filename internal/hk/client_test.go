@@ -3,9 +3,11 @@ package hk
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/mgh3326/recallbeam/internal/core"
@@ -130,5 +132,74 @@ func TestResolveUsingExistingPaginatedAPIs(t *testing.T) {
 	_, err := c.Fetch(t.Context(), "decision", core.Ref{ID: "missing"})
 	if !errors.Is(err, core.ErrNotFound) {
 		t.Fatal(err)
+	}
+}
+
+// No network is used: the transport records whether credentials reach it.
+func TestSourceURLPolicyBeforeCredentials(t *testing.T) {
+	for _, tc := range []struct {
+		base    string
+		allowed bool
+	}{
+		{"https://source.invalid", true},
+		{"http://127.0.0.1", true},
+		{"http://[::1]", true},
+		{"http://source.invalid", false},
+		{"http://192.0.2.1", false},
+		{"http://localhost", false},
+		{"ftp://source.invalid", false},
+		{"https://user:password@source.invalid", false},
+		{"https://source.invalid/#fragment", false},
+		{"/relative", false},
+	} {
+		t.Run(tc.base, func(t *testing.T) {
+			calls := 0
+			c := Client{Base: tc.base, Token: "test-secret", HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if r.Header.Get("Authorization") != "Bearer test-secret" {
+					t.Error("authorized request lost token")
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"_metadata_":{"last_sync_id":0,"max_sync_id":0,"schema_version":1}}`))}, nil
+			})}}
+			_, err := c.Delta(t.Context(), 0)
+			if tc.allowed {
+				if err != nil || calls != 1 {
+					t.Fatalf("allowed URL: calls=%d err=%v", calls, err)
+				}
+			} else if err == nil || calls != 0 {
+				t.Fatalf("unsafe URL reached transport: calls=%d err=%v", calls, err)
+			}
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestSourceHTTPSDoesNotRedirectCredentials(t *testing.T) {
+	var leaked atomic.Bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			leaked.Store(true)
+		}
+		fmt.Fprintln(w, `{"_metadata_":{"last_sync_id":0,"max_sync_id":0,"schema_version":1}}`)
+	}))
+	defer target.Close()
+	source := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-secret" {
+			t.Error("missing source token")
+		}
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+	injected := source.Client()
+	c := Client{Base: source.URL, Token: "test-secret", HTTP: injected}
+	_, err := c.Delta(t.Context(), 0)
+	if err == nil || leaked.Load() {
+		t.Fatalf("redirect followed: err=%v leaked=%v", err, leaked.Load())
+	}
+	if injected.CheckRedirect != nil {
+		t.Fatal("mutated caller's HTTP client")
 	}
 }

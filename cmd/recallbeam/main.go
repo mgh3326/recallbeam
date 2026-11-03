@@ -100,10 +100,7 @@ func run() error {
 			return errors.New("RB_SYNC_INTERVAL must be between 1s and 1h")
 		}
 	}
-	addr := os.Getenv("RB_LISTEN_ADDR")
-	if addr == "" {
-		addr = ":8080"
-	}
+	addr := listenAddress()
 	server := &http.Server{Addr: addr, Handler: transport.HTTP(st, os.Getenv("RB_SEARCH_TOKEN")), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: time.Minute}
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -163,4 +160,11 @@ func keepalive(ctx context.Context, interval time.Duration, query func(context.C
 			cancel()
 		}
 	}
+}
+
+func listenAddress() string {
+	if addr := os.Getenv("RB_LISTEN_ADDR"); addr != "" {
+		return addr
+	}
+	return "127.0.0.1:8080"
 }

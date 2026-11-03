@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -29,11 +30,19 @@ func (c Client) get(ctx context.Context, path string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
-	client := c.HTTP
-	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	// Validate the destination before attaching credentials or invoking a transport.
+	u := req.URL
+	addr, ipErr := netip.ParseAddr(u.Hostname())
+	if u.Hostname() == "" || u.User != nil || u.Fragment != "" || (u.Scheme != "https" && !(u.Scheme == "http" && ipErr == nil && addr.IsLoopback())) {
+		return nil, errors.New("hk source URL requires HTTPS; HTTP is allowed only for literal loopback IPs")
 	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	client := http.Client{Timeout: 60 * time.Second}
+	if c.HTTP != nil {
+		client = *c.HTTP
+	}
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
 	r, err := client.Do(req)
 	if err != nil {
 		return nil, errors.New("hk request failed")
