@@ -68,7 +68,7 @@ func run() error {
 	defer stop()
 	if mode == "migrate" {
 		if err = migrations.Run(ctx, db); err != nil {
-			return errors.New("migration failed; inspect database migration state")
+			return fmt.Errorf("migration failed; inspect database migration state: %w", err)
 		}
 		return nil
 	}
@@ -86,7 +86,7 @@ func run() error {
 	engine := &core.Engine{Store: st, Source: hk.Client{Base: os.Getenv("RB_HK_URL"), Token: os.Getenv("RB_HK_TOKEN")}, Name: "hk"}
 	if mode == "rebuild" {
 		if err = engine.Tick(ctx, true); err != nil {
-			return errors.New("rebuild failed; active index preserved")
+			return errors.New("rebuild failed; publication outcome may be unknown; rerun rebuild")
 		}
 		return nil
 	}
@@ -101,7 +101,7 @@ func run() error {
 		}
 	}
 	addr := listenAddress()
-	server := &http.Server{Addr: addr, Handler: transport.HTTP(st, os.Getenv("RB_SEARCH_TOKEN")), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: time.Minute}
+	server := &http.Server{Addr: addr, Handler: transport.HTTP(st, os.Getenv("RB_SEARCH_TOKEN")), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 90 * time.Second, IdleTimeout: time.Minute}
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	done := make(chan struct{})

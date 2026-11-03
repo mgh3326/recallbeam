@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/recallbeam/internal/core"
 )
@@ -101,5 +103,60 @@ func TestMCPRejectsExplicitZeroLimit(t *testing.T) {
 	err := MCP(t.Context(), strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{"q":"test","limit":0}}}`+"\n"), &out, s)
 	if err != nil || s.calls != 0 || !strings.Contains(out.String(), `"code":-32602`) {
 		t.Fatal(err, out.String())
+	}
+}
+
+func TestMCPCancellationUnblocksIdleInput(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- MCP(ctx, reader, io.Discard, &search{}) }()
+	// Complete a frame so the scanner is running, then leave stdin open and idle.
+	if _, err := io.WriteString(writer, "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n"); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("MCP did not return while stdin stayed open")
+	}
+	if _, err := writer.Write([]byte("x")); !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("scanner input was not closed: %v", err)
+	}
+}
+func TestMCPRejectsMalformedInitializeParameters(t *testing.T) {
+	for _, params := range []string{`{"protocolVersion":42}`, `null`, `{}`, `[]`} {
+		var out bytes.Buffer
+		input := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":` + params + "}\n"
+		if err := MCP(t.Context(), strings.NewReader(input), &out, &search{}); err != nil || !strings.Contains(out.String(), `"code":-32602`) {
+			t.Fatal(params, err, out.String())
+		}
+	}
+}
+func TestMCPRejectsArgumentsOutsideSchema(t *testing.T) {
+	for _, args := range []string{`{"q":"test","limit":null}`, `{"q":"test","extra":1}`, `{"q":"test","model":null}`, `{"q":"test","limit":1.5}`, `{"q":"test","model":""}`, `null`} {
+		var out bytes.Buffer
+		s := &search{}
+		input := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":` + args + "}}\n"
+		if err := MCP(t.Context(), strings.NewReader(input), &out, s); err != nil || s.calls != 0 || !strings.Contains(out.String(), `"code":-32602`) {
+			t.Fatal(args, err, out.String())
+		}
+	}
+}
+func TestHTTPRejectsMalformedQueryEncoding(t *testing.T) {
+	s := &search{}
+	r := httptest.NewRequest("GET", "/v1/search?q=test&limit=%GG", nil)
+	r.Header.Set("Authorization", "Bearer test")
+	w := httptest.NewRecorder()
+	HTTP(s, "test").ServeHTTP(w, r)
+	if w.Code != 400 || s.calls != 0 {
+		t.Fatal(w.Code, s.calls, w.Body.String())
 	}
 }

@@ -155,6 +155,7 @@ independently of ingestion, to keep an otherwise idle database active. Failures
 are logged and retried on the next interval. Run the service continuously under
 a process supervisor; a stopped process cannot prevent database auto-stop.
 SIGINT/SIGTERM cancels ingestion and shuts down the HTTP listener.
+MCP also exits on either signal while its client keeps stdin open.
 
 ## Verification
 
