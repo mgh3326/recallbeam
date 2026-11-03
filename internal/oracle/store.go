@@ -12,6 +12,10 @@ import (
 	goora "github.com/sijms/go-ora/v2"
 )
 
+// TextVersion names how Apply builds search_text from a document. Bump it
+// with any change there; it is an input to core.Generation.
+const TextVersion = 1
+
 type Store struct {
 	DB     *sql.DB
 	Source string
@@ -67,7 +71,9 @@ func (s *Store) Cursor(ctx context.Context, shadow bool) (core.Cursor, bool, err
 	if err != nil {
 		return c, false, err
 	}
-	err = s.DB.QueryRowContext(ctx, "SELECT last_sync_id,schema_version FROM rb_cursor_"+slot+" WHERE source=:1", s.Source).Scan(&c.Last, &c.Schema)
+	// The schema_version column holds the cursor's core.Generation. A value
+	// written before that (an hk schema version) mismatches and rebuilds once.
+	err = s.DB.QueryRowContext(ctx, "SELECT last_sync_id,schema_version FROM rb_cursor_"+slot+" WHERE source=:1", s.Source).Scan(&c.Last, &c.Generation)
 	if errors.Is(err, sql.ErrNoRows) {
 		return c, false, nil
 	}
@@ -116,7 +122,7 @@ WHEN NOT MATCHED THEN INSERT(source,model,model_id,doc_key,title,body,tags,updat
 			return err
 		}
 	}
-	_, err = tx.ExecContext(ctx, `MERGE INTO rb_cursor_`+slot+` c USING (SELECT :p1 source FROM dual) x ON (c.source=x.source) WHEN MATCHED THEN UPDATE SET c.last_sync_id=:p2,c.schema_version=:p3 WHEN NOT MATCHED THEN INSERT(source,last_sync_id,schema_version) VALUES(x.source,:p2,:p3)`, binds(s.Source, c.Last, c.Schema)...)
+	_, err = tx.ExecContext(ctx, `MERGE INTO rb_cursor_`+slot+` c USING (SELECT :p1 source FROM dual) x ON (c.source=x.source) WHEN MATCHED THEN UPDATE SET c.last_sync_id=:p2,c.schema_version=:p3 WHEN NOT MATCHED THEN INSERT(source,last_sync_id,schema_version) VALUES(x.source,:p2,:p3)`, binds(s.Source, c.Last, c.Generation)...)
 	if err != nil {
 		return err
 	}

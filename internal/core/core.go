@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -19,6 +21,12 @@ var ErrNotFound = errors.New("source row missing")
 // is unreachable, refuses the credentials, or lacks the read endpoint. Such
 // failures always hold the cursor; only row-specific failures can be skipped.
 var ErrUnavailable = errors.New("source unavailable")
+
+// ErrIncompatible marks a fetched row that lacks a field the extractor reads,
+// or carries it with another JSON type, as after a source migration renames or
+// retypes a column. Every row of the model is affected, so it holds the cursor
+// like ErrUnavailable and is logged on each poll instead of being skipped.
+var ErrIncompatible = errors.New("source row shape incompatible")
 
 // RowAttempts is how many polls one row may fail to fetch before the engine
 // leaves it out of its page so the cursor can advance. The skipped row keeps
@@ -74,10 +82,28 @@ type Delta struct {
 	Changes []Change
 	Metadata
 }
+
+// Cursor is a table set's replay position and the Generation that built it.
 type Cursor struct {
-	Last   int64
-	Schema int
+	Last       int64
+	Generation int64
 }
+
+// Generation identifies how this build turns source rows into index rows: the
+// indexed models plus every extractor and index setting named in parts. A
+// table set built by another generation is rebuilt. The source's own schema
+// version is deliberately not an input; row shape is checked on each fetch.
+func Generation(parts ...string) int64 {
+	h := sha256.New()
+	for _, m := range Models {
+		fmt.Fprintf(h, "model %q\n", m)
+	}
+	for _, p := range parts {
+		fmt.Fprintf(h, "part %q\n", p)
+	}
+	return int64(binary.BigEndian.Uint64(h.Sum(nil)) >> 1)
+}
+
 type Source interface {
 	Bootstrap(context.Context, string, string) (Page, error)
 	Delta(context.Context, int64) (Delta, error)
@@ -100,6 +126,11 @@ type Engine struct {
 	Source Source
 	Store  Index
 	Name   string
+	// Generation is this build's Generation key, stored with every cursor.
+	Generation int64
+	// sourceSchema is the last source schema version seen, kept only to log
+	// changes; a change alone does not rebuild.
+	sourceSchema int
 	// failures counts consecutive failed fetches per model/ID. Tick holds the
 	// writer lock, so access is serialized.
 	failures map[string]int
@@ -114,6 +145,10 @@ func (e *Engine) Tick(ctx context.Context, rebuild bool) error {
 	c, ok, err := e.Store.Cursor(ctx, false)
 	if err != nil {
 		return err
+	}
+	if ok && c.Generation != e.Generation {
+		log.Printf("sync.generation_changed from=%d to=%d", c.Generation, e.Generation)
+		rebuild = true
 	}
 	if rebuild || !ok {
 		return e.rebuild(ctx)
@@ -142,7 +177,10 @@ func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, erro
 		key := it.model + "/" + it.ref.ID
 		d, err := e.Source.Fetch(ctx, it.model, it.ref)
 		if err != nil && !errors.Is(err, ErrNotFound) {
-			if ctx.Err() != nil || errors.Is(err, ErrReset) || errors.Is(err, ErrUnavailable) {
+			if errors.Is(err, ErrIncompatible) {
+				log.Printf("sync.row_incompatible model=%s model_id=%q err=%q", it.model, it.ref.ID, err)
+			}
+			if ctx.Err() != nil || errors.Is(err, ErrReset) || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrIncompatible) {
 				return nil, err
 			}
 			if e.failures == nil {
@@ -176,8 +214,7 @@ func (e *Engine) rebuild(ctx context.Context) error {
 	if err := e.Store.Reset(ctx); err != nil {
 		return err
 	}
-	c := Cursor{Last: -1}
-	schema := 0
+	c := Cursor{Last: -1, Generation: e.Generation}
 	for _, model := range Models {
 		next := ""
 		seen := map[string]bool{}
@@ -189,16 +226,12 @@ func (e *Engine) rebuild(ctx context.Context) error {
 			if p.Schema < 1 || p.Max < 0 {
 				return errors.New("invalid bootstrap metadata")
 			}
-			if schema != 0 && schema != p.Schema {
-				return ErrReset
-			}
-			schema = p.Schema
+			e.observeSchema(p.Schema)
 			// Different model snapshots start at different watermarks. Replay from the
 			// earliest one so writes during any model scan cannot fall through a gap.
 			if c.Last < 0 || p.Max < c.Last {
 				c.Last = p.Max
 			}
-			c.Schema = schema
 			items := make([]fetch, 0, len(p.Rows))
 			for _, r := range p.Rows {
 				items = append(items, fetch{model: model, ref: r, syncID: p.Max})
@@ -230,12 +263,10 @@ func (e *Engine) delta(ctx context.Context, shadow bool, c Cursor, publish bool)
 		if err != nil {
 			return c, err
 		}
-		if d.Schema != c.Schema {
-			return c, ErrReset
-		}
-		if d.Last < c.Last || d.Max < d.Last {
+		if d.Schema < 1 || d.Last < c.Last || d.Max < d.Last {
 			return c, errors.New("invalid delta metadata")
 		}
+		e.observeSchema(d.Schema)
 		if target < 0 {
 			target = d.Max
 		}
@@ -278,7 +309,7 @@ func (e *Engine) delta(ctx context.Context, shadow bool, c Cursor, publish bool)
 		if d.Last == c.Last && d.Last < target {
 			return c, errors.New("delta made no progress")
 		}
-		c = Cursor{Last: d.Last, Schema: d.Schema}
+		c.Last = d.Last
 		done := c.Last >= target
 		if err = e.Store.Apply(ctx, shadow, ms, c, publish && done); err != nil {
 			return c, err
@@ -287,6 +318,15 @@ func (e *Engine) delta(ctx context.Context, shadow bool, c Cursor, publish bool)
 			return c, nil
 		}
 	}
+}
+
+// observeSchema logs a source schema version change. A migration that changes
+// a row shape the extractor reads surfaces as ErrIncompatible on fetch.
+func (e *Engine) observeSchema(v int) {
+	if e.sourceSchema != 0 && e.sourceSchema != v {
+		log.Printf("sync.source_schema_changed from=%d to=%d", e.sourceSchema, v)
+	}
+	e.sourceSchema = v
 }
 
 type Query struct {

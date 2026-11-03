@@ -88,7 +88,7 @@ func (s source) Fetch(_ context.Context, m string, r core.Ref) (core.Doc, error)
 func emptyBootstrap(m, c string) (core.Page, error) { return core.Page{Max: 10, Schema: 1}, nil }
 func seed(m *memory) {
 	m.exists[0] = true
-	m.cursors[0] = core.Cursor{Last: 10, Schema: 1}
+	m.cursors[0] = core.Cursor{Last: 10}
 	m.docs[0]["document/old"] = core.Doc{ID: "old", Body: "old"}
 }
 func TestDeltaIdempotentUpsertDeleteAndCursor(t *testing.T) {
@@ -149,30 +149,81 @@ func TestBootstrapShadowSwapReplaysEarliestWatermark(t *testing.T) {
 		t.Fatalf("bad rebuild %+v after %v", m, after)
 	}
 }
-func TestResetAndSchemaChangeRebuild(t *testing.T) {
-	for _, schema := range []bool{false, true} {
-		t.Run(map[bool]string{false: "410", true: "schema"}[schema], func(t *testing.T) {
+func TestResetAndGenerationChangeRebuild(t *testing.T) {
+	for _, reason := range []string{"410", "generation"} {
+		t.Run(reason, func(t *testing.T) {
 			m := newMemory()
 			seed(m)
 			calls := 0
 			s := source{bootstrap: emptyBootstrap, delta: func(int64) (core.Delta, error) {
 				calls++
-				if calls == 1 {
-					if schema {
-						return core.Delta{Metadata: core.Metadata{Last: 10, Max: 10, Schema: 2}}, nil
-					}
+				if calls == 1 && reason == "410" {
 					return core.Delta{}, core.ErrReset
 				}
 				return core.Delta{Metadata: core.Metadata{Last: 10, Max: 10, Schema: 1}}, nil
 			}}
 			e := core.Engine{Source: s, Store: m, Name: "hk"}
+			if reason == "generation" {
+				e.Generation = core.Generation("extract 2")
+			}
 			if err := e.Tick(t.Context(), false); err != nil {
 				t.Fatal(err)
 			}
-			if m.active != 1 || len(m.docs[1]) != 0 {
-				t.Fatal("did not replace old index")
+			if m.active != 1 || len(m.docs[1]) != 0 || m.cursors[1].Generation != e.Generation {
+				t.Fatalf("did not replace old index: %+v", m)
 			}
 		})
+	}
+}
+func TestSourceSchemaChangeDoesNotRebuild(t *testing.T) {
+	m := newMemory()
+	seed(m)
+	s := source{bootstrap: func(string, string) (core.Page, error) {
+		t.Fatal("source schema change started a rebuild")
+		return core.Page{}, nil
+	}, delta: func(a int64) (core.Delta, error) {
+		if a == 11 {
+			return core.Delta{Metadata: core.Metadata{Last: 11, Max: 11, Schema: 31}}, nil
+		}
+		return core.Delta{Changes: []core.Change{{SyncID: 11, Model: "task", ID: "1", Action: "U"}}, Metadata: core.Metadata{Last: 11, Max: 11, Schema: 30}}, nil
+	}}
+	e := core.Engine{Source: s, Store: m, Name: "hk"}
+	for range 2 {
+		if err := e.Tick(t.Context(), false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if m.active != 0 || m.cursors[0].Last != 11 || m.docs[0]["task/1"].Body != "current" {
+		t.Fatalf("bad state %+v", m)
+	}
+}
+func TestIncompatibleRowShapeHoldsCursor(t *testing.T) {
+	m := newMemory()
+	seed(m)
+	s := source{delta: func(int64) (core.Delta, error) {
+		return core.Delta{Changes: []core.Change{{SyncID: 11, Model: "document", ID: "1", Action: "U"}}, Metadata: core.Metadata{Last: 11, Max: 11, Schema: 31}}, nil
+	}, fetch: func(string, core.Ref) (core.Doc, error) {
+		return core.Doc{}, fmt.Errorf("body renamed: %w", core.ErrIncompatible)
+	}}
+	e := core.Engine{Source: s, Store: m, Name: "hk"}
+	for range core.RowAttempts * 2 {
+		if err := e.Tick(t.Context(), false); !errors.Is(err, core.ErrIncompatible) {
+			t.Fatal("incompatible shape was not reported", err)
+		}
+	}
+	if m.cursors[0].Last != 10 || m.active != 0 {
+		t.Fatal("incompatible shape was skipped or rebuilt")
+	}
+}
+func TestGenerationKey(t *testing.T) {
+	a := core.Generation("hk extract 1", "oracle text 1", "migrations x")
+	if a <= 0 || a != core.Generation("hk extract 1", "oracle text 1", "migrations x") {
+		t.Fatal("generation must be positive and deterministic")
+	}
+	for _, parts := range [][]string{{"hk extract 2", "oracle text 1", "migrations x"}, {"hk extract 1", "oracle text 2", "migrations x"}, {"hk extract 1", "oracle text 1", "migrations y"}, {"hk extract 1oracle text 1", "migrations x"}} {
+		if core.Generation(parts...) == a {
+			t.Fatalf("generation ignored a change: %q", parts)
+		}
 	}
 }
 func TestFailedRebuildKeepsActiveAndRetryResetsShadow(t *testing.T) {

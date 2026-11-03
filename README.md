@@ -120,13 +120,30 @@ Each delta page's mutations and cursor commit together. A database row lock
 serializes writers across processes, including manual rebuilds. Search keeps
 running while a writer bootstraps or replays changes.
 
-With no cursor, on HTTP 410, or on schema version change, the engine rebuilds
-an inactive table set. It takes the earliest bootstrap watermark across all
-models, then replays delta to the high-water mark observed at replay start.
-The final delta transaction publishes the inactive set by changing
-`rb_state.active_slot` alongside its cursor. A failed rebuild keeps the old
-index active; retry clears the abandoned inactive set. The next rebuild or
-reconciliation reclaims old rows, so allow room for two copies of the index.
+With no cursor, on HTTP 410, or when the stored generation differs from the
+running build's, the engine rebuilds an inactive table set. The generation is
+recallbeam's own key: a hash of the indexed models, `hk.ExtractVersion` (how
+rows map to indexed fields), `oracle.TextVersion` (how `search_text` is built)
+and every embedded migration (lexer, stoplist, index parameters). Bump the
+matching version with any change to extraction or `search_text`;
+`TestExtractionPinsVersion` fails until the extraction bump is made. The
+generation is stored in the cursor tables' `schema_version` column, so the
+first start after this change rebuilds once.
+
+A rebuild takes the earliest bootstrap watermark across all models, then
+replays delta to the high-water mark observed at replay start. The final
+delta transaction publishes the inactive set by changing `rb_state.active_slot`
+alongside its cursor. A failed rebuild keeps the old index active; retry
+clears the abandoned inactive set. The next rebuild or reconciliation reclaims
+old rows, so allow room for two copies of the index.
+
+hk's `schema_version` is not part of the generation, because most hk
+migrations do not touch the rows recallbeam reads. A change is logged as
+`sync.source_schema_changed`. Every fetched row is checked for the fields the
+extractor reads and their JSON type. A missing or retyped field returns
+`ErrIncompatible`, logged as `sync.row_incompatible` on each poll. That error
+holds the cursor and is never skipped, and the index stays as it was until a
+recallbeam release handles the new shape.
 
 `rb_docs` and `rb_cursor` are active-set views over paired physical tables
 `rb_docs_a/b` and `rb_cursor_a/b`. Physical document primary keys are
@@ -136,10 +153,12 @@ No DDL runs during a rebuild.
 
 `recallbeam serve` polls continuously and performs a full reconciliation every
 24 hours. `recallbeam rebuild` forces a rebuild immediately. Failures leave the
-last published index available. A schema change during rebuilding aborts it;
-the next poll retries. Source retention must exceed the time needed for a full
-bootstrap and replay. Monitor sync errors and compare the active cursor with
-the source high-water mark. Oracle Text failures can be investigated through
+last published index available. recallbeam does not abort a rebuild on a
+source schema change. hk rejects a bootstrap cursor issued before its own
+migration with 400, which fails that rebuild, and the next attempt retries.
+Source retention must exceed the time needed for a full bootstrap and replay.
+Monitor sync errors and compare the active cursor with the source high-water
+mark. Oracle Text failures can be investigated through
 `CTX_USER_INDEX_ERRORS` and pending work through `CTX_USER_PENDING`.
 
 ## Oracle Text and operations
