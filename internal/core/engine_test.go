@@ -3,6 +3,7 @@ package core_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -240,5 +241,117 @@ func TestRankingTiers(t *testing.T) {
 	ko := core.Rank("검색", []core.Hit{{Doc: core.Doc{ID: "2", Title: "검색 도구"}}, {Doc: core.Doc{ID: "1", Title: "검색"}}})
 	if ko[0].ID != "1" {
 		t.Fatal(ko)
+	}
+}
+func TestDeltaCoalescesEventsPerRow(t *testing.T) {
+	m := newMemory()
+	seed(m)
+	m.docs[0]["document/3"] = core.Doc{ID: "3"}
+	fetched := map[string]int{}
+	s := source{delta: func(int64) (core.Delta, error) {
+		return core.Delta{Changes: []core.Change{
+			{SyncID: 11, Model: "task", ID: "1", Action: "I"},
+			{SyncID: 12, Model: "task", ID: "1", Action: "U"},
+			{SyncID: 13, Model: "document", ID: "2", Action: "U"},
+			{SyncID: 14, Model: "document", ID: "3", Action: "U"},
+			{SyncID: 15, Model: "task", ID: "1", Action: "U"},
+			{SyncID: 16, Model: "document", ID: "3", Action: "D"},
+			{SyncID: 17, Model: "decision", ID: "old", Action: "D"},
+			{SyncID: 18, Model: "decision", ID: "old", Action: "I"},
+		}, Metadata: core.Metadata{Last: 18, Max: 18, Schema: 1}}, nil
+	}, fetch: func(model string, r core.Ref) (core.Doc, error) {
+		fetched[model+"/"+r.ID]++
+		return core.Doc{Body: "current"}, nil
+	}}
+	e := core.Engine{Source: s, Store: m, Name: "hk"}
+	if err := e.Tick(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fetched, map[string]int{"task/1": 1, "document/2": 1, "decision/old": 1}) {
+		t.Fatalf("fetches %v", fetched)
+	}
+	docs := m.docs[0]
+	if docs["task/1"].SyncID != 15 || docs["decision/old"].SyncID != 18 || docs["document/2"].SyncID != 13 {
+		t.Fatalf("sync IDs %+v", docs)
+	}
+	if _, ok := docs["document/3"]; ok || m.cursors[0].Last != 18 {
+		t.Fatalf("bad state %+v", m)
+	}
+}
+func TestFailingRowDoesNotFreezeCursor(t *testing.T) {
+	m := newMemory()
+	seed(m)
+	m.docs[0]["task/bad"] = core.Doc{Body: "stale"}
+	attempts := 0
+	s := source{delta: func(a int64) (core.Delta, error) {
+		if a == 12 {
+			return core.Delta{Metadata: core.Metadata{Last: 12, Max: 12, Schema: 1}}, nil
+		}
+		return core.Delta{Changes: []core.Change{{SyncID: 11, Model: "task", ID: "bad", Action: "U"}, {SyncID: 12, Model: "task", ID: "ok", Action: "U"}}, Metadata: core.Metadata{Last: 12, Max: 12, Schema: 1}}, nil
+	}, fetch: func(_ string, r core.Ref) (core.Doc, error) {
+		if r.ID == "bad" {
+			attempts++
+			return core.Doc{}, errors.New("hk status 500")
+		}
+		return core.Doc{Body: "current"}, nil
+	}}
+	e := core.Engine{Source: s, Store: m, Name: "hk"}
+	for i := 1; i < core.RowAttempts; i++ {
+		if e.Tick(t.Context(), false) == nil || m.cursors[0].Last != 10 {
+			t.Fatalf("attempt %d: row failure must hold the cursor before the limit", i)
+		}
+	}
+	if err := e.Tick(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+	if m.cursors[0].Last != 12 || m.docs[0]["task/ok"].Body != "current" || m.docs[0]["task/bad"].Body != "stale" || attempts != core.RowAttempts {
+		t.Fatalf("bad state %+v attempts=%d", m, attempts)
+	}
+}
+func TestSourceUnavailableAlwaysHoldsCursor(t *testing.T) {
+	m := newMemory()
+	seed(m)
+	s := source{delta: func(int64) (core.Delta, error) {
+		return core.Delta{Changes: []core.Change{{SyncID: 11, Model: "task", ID: "1", Action: "U"}}, Metadata: core.Metadata{Last: 11, Max: 11, Schema: 1}}, nil
+	}, fetch: func(string, core.Ref) (core.Doc, error) {
+		return core.Doc{}, fmt.Errorf("hk status 503: %w", core.ErrUnavailable)
+	}}
+	e := core.Engine{Source: s, Store: m, Name: "hk"}
+	for range core.RowAttempts * 2 {
+		if e.Tick(t.Context(), false) == nil {
+			t.Fatal("outage skipped a row")
+		}
+	}
+	if m.cursors[0].Last != 10 {
+		t.Fatal("advanced cursor during outage")
+	}
+}
+func TestRebuildSkipsRowThatKeepsFailing(t *testing.T) {
+	m := newMemory()
+	seed(m)
+	s := source{bootstrap: func(model, _ string) (core.Page, error) {
+		if model == "document" {
+			return core.Page{Rows: []core.Ref{{ID: "bad", Key: "k"}, {ID: "ok", Key: "k2"}}, Max: 10, Schema: 1}, nil
+		}
+		return core.Page{Max: 10, Schema: 1}, nil
+	}, delta: func(int64) (core.Delta, error) {
+		return core.Delta{Metadata: core.Metadata{Last: 10, Max: 10, Schema: 1}}, nil
+	}, fetch: func(_ string, r core.Ref) (core.Doc, error) {
+		if r.ID == "bad" {
+			return core.Doc{}, errors.New("row exceeds limit")
+		}
+		return core.Doc{Body: "current"}, nil
+	}}
+	e := core.Engine{Source: s, Store: m, Name: "hk"}
+	for i := 1; i < core.RowAttempts; i++ {
+		if e.Tick(t.Context(), true) == nil || m.active != 0 {
+			t.Fatal("rebuild published before the row exhausted its attempts")
+		}
+	}
+	if err := e.Tick(t.Context(), true); err != nil {
+		t.Fatal(err)
+	}
+	if m.active != 1 || len(m.docs[1]) != 1 || m.docs[1]["document/ok"].Body != "current" {
+		t.Fatalf("bad rebuild %+v", m)
 	}
 }

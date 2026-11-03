@@ -27,8 +27,8 @@ func TestFakeHKBootstrapDeltaAndFetch(t *testing.T) {
 		case "/v1/sync/delta":
 			fmt.Fprintln(w, `{"sync_id":43,"model":"document","model_id":"7","action":"U","at":"2026-01-01T00:00:00Z"}`)
 			fmt.Fprintln(w, `{"_metadata_":{"last_sync_id":43,"max_sync_id":43,"schema_version":1}}`)
-		case "/v1/documents/design/a":
-			fmt.Fprint(w, `{"id":7,"key":"design/a","body":"한국어","updated_at":"2026-01-01T00:00:00Z"}`)
+		case "/v1/sync/rows/document/7":
+			fmt.Fprint(w, `{"id":7,"key":"design/a","body":"한국어","updated_at":"2026-01-01T00:00:00.123456+09:00"}`)
 		case "/v1/tasks/9":
 			fmt.Fprint(w, `{"id":9,"title":"Task","refs":{"linear":{"brief":"details"}},"events":[{"note":"done"}]}`)
 		case "/v1/sync/rows/task_comment/3":
@@ -87,50 +87,70 @@ func TestMissingReadEndpointIsNotATombstone(t *testing.T) {
 	defer server.Close()
 	c := Client{Base: server.URL}
 	_, err := c.Fetch(t.Context(), "task_comment", core.Ref{ID: "1"})
-	if err == nil || errors.Is(err, core.ErrNotFound) {
+	if err == nil || errors.Is(err, core.ErrNotFound) || !errors.Is(err, core.ErrUnavailable) {
 		t.Fatal("missing endpoint could silently delete indexed rows", err)
 	}
 }
-func TestResolveUsingExistingPaginatedAPIs(t *testing.T) {
+func TestFetchResolvesRowsDirectly(t *testing.T) {
+	var paths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/v1/sync/bootstrap":
-			if r.URL.Query().Get("model") == "document" {
-				fmt.Fprint(w, `{"rows":[{"id":"7","key":"design/a"}],"schema_version":1}`)
-				return
-			}
-			if r.URL.Query().Get("cursor") == "" {
-				fmt.Fprint(w, `{"rows":[{"id":"1"}],"cursor":"next","schema_version":1}`)
-			} else {
-				fmt.Fprint(w, `{"rows":[{"id":"2","updated_at":"2026-01-01T00:00:00Z"}],"schema_version":1}`)
-			}
-		case "/v1/documents/design/a":
-			fmt.Fprint(w, `{"key":"design/a","body":"doc"}`)
-		case "/v1/tasks/1/comments":
-			fmt.Fprint(w, `{"comments":[]}`)
-		case "/v1/tasks/2/comments":
-			if r.URL.Query().Get("after_id") != "8" {
-				t.Error(r.URL)
-			}
-			fmt.Fprint(w, `{"comments":[{"id":9,"body":"comment","created_at":"2026-01-01T00:00:00Z"}]}`)
-		case "/v1/tasks/1":
-			fmt.Fprint(w, `{"refs":{}}`)
-		case "/v1/tasks/2":
-			fmt.Fprint(w, `{"refs":{"decision_request":{"id":"decision-1","question":"Which?","resolution":{"reason":"chosen"}}}}`)
+		paths = append(paths, r.URL.EscapedPath())
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.EscapedPath() {
+		case "/v1/sync/rows/document/7":
+			fmt.Fprint(w, `{"id":7,"key":"linear/MGH-1","kind":"note","body":"doc","updated_at":"2026-01-01T00:00:00+00:00"}`)
+		case "/v1/sync/rows/task_comment/9":
+			fmt.Fprint(w, `{"id":9,"task_id":2,"body":"comment","author":"a","created_at":"2026-01-01T00:00:00+00:00"}`)
+		case "/v1/sync/rows/decision/req/a%20b":
+			fmt.Fprint(w, `{"id":"req/a b","question":"Which?","resolution":{"reason":"chosen"},"task_id":2,"updated_at":"2026-01-02T00:00:00+00:00","options":[{"label":"x"}]}`)
+		case "/v1/sync/rows/decision/gone":
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"deleted":true}`)
+		case "/v1/sync/rows/document/8":
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"error":"internal_error"}`)
 		default:
+			t.Errorf("unexpected request %s", r.URL)
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 	c := Client{Base: server.URL}
-	for _, tc := range []struct{ model, id, want string }{{"document", "7", "doc"}, {"task_comment", "9", "comment"}, {"decision", "decision-1", "chosen"}} {
+	for _, tc := range []struct{ model, id, want string }{{"document", "7", "doc"}, {"task_comment", "9", "comment"}, {"decision", "req/a b", "chosen"}} {
 		d, err := c.Fetch(t.Context(), tc.model, core.Ref{ID: tc.id})
-		if err != nil || !strings.Contains(d.Body, tc.want) {
+		if err != nil || !strings.Contains(d.Body, tc.want) || d.UpdatedAt.IsZero() {
 			t.Fatalf("%s: %+v %v", tc.model, d, err)
 		}
+		if tc.model == "document" && (d.Key != "linear/MGH-1" || d.Identifier != "MGH-1" || d.Tags != "note") {
+			t.Fatalf("document fields: %+v", d)
+		}
+		if tc.model == "decision" && (d.Title != "Which?" || !strings.Contains(d.Body, `"options"`)) {
+			t.Fatalf("decision fields: %+v", d)
+		}
 	}
-	_, err := c.Fetch(t.Context(), "decision", core.Ref{ID: "missing"})
-	if !errors.Is(err, core.ErrNotFound) {
+	if _, err := c.Fetch(t.Context(), "decision", core.Ref{ID: "gone"}); !errors.Is(err, core.ErrNotFound) {
+		t.Fatal(err)
+	}
+	// A row-specific server error is not a deletion and not a source outage.
+	if _, err := c.Fetch(t.Context(), "document", core.Ref{ID: "8"}); err == nil || errors.Is(err, core.ErrNotFound) || errors.Is(err, core.ErrUnavailable) {
+		t.Fatal(err)
+	}
+	if len(paths) != 5 {
+		t.Fatalf("each fetch must be one request, got %v", paths)
+	}
+}
+
+func TestSourceWideFailuresAreUnavailable(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
+		_, err := Client{Base: server.URL}.Fetch(t.Context(), "document", core.Ref{ID: "1"})
+		server.Close()
+		if !errors.Is(err, core.ErrUnavailable) {
+			t.Fatalf("status %d: %v", status, err)
+		}
+	}
+	_, err := Client{Base: "http://127.0.0.1:1"}.Fetch(t.Context(), "document", core.Ref{ID: "1"})
+	if !errors.Is(err, core.ErrUnavailable) {
 		t.Fatal(err)
 	}
 }

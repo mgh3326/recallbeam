@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -13,6 +14,17 @@ import (
 var Models = []string{"document", "task", "task_comment", "decision"}
 var ErrReset = errors.New("source requires bootstrap")
 var ErrNotFound = errors.New("source row missing")
+
+// ErrUnavailable marks a source failure that is not about one row: the source
+// is unreachable, refuses the credentials, or lacks the read endpoint. Such
+// failures always hold the cursor; only row-specific failures can be skipped.
+var ErrUnavailable = errors.New("source unavailable")
+
+// RowAttempts is how many polls one row may fail to fetch before the engine
+// leaves it out of its page so the cursor can advance. The skipped row keeps
+// its previously indexed content until a later change or the daily rebuild
+// fetches it successfully.
+const RowAttempts = 3
 
 func ValidModel(m string) bool {
 	for _, v := range Models {
@@ -88,6 +100,9 @@ type Engine struct {
 	Source Source
 	Store  Index
 	Name   string
+	// failures counts consecutive failed fetches per model/ID. Tick holds the
+	// writer lock, so access is serialized.
+	failures map[string]int
 }
 
 func (e *Engine) Tick(ctx context.Context, rebuild bool) error {
@@ -109,22 +124,51 @@ func (e *Engine) Tick(ctx context.Context, rebuild bool) error {
 	}
 	return err
 }
-func (e *Engine) mutations(ctx context.Context, model string, refs []Ref, syncID int64) ([]Mutation, error) {
-	out := make([]Mutation, 0, len(refs))
-	for _, r := range refs {
-		d, err := e.Source.Fetch(ctx, model, r)
-		if errors.Is(err, ErrNotFound) {
-			out = append(out, Mutation{Doc: Doc{Source: e.Name, Model: model, ID: r.ID, SyncID: syncID}, Delete: true})
+
+type fetch struct {
+	model  string
+	ref    Ref
+	syncID int64
+}
+
+// mutations fetches the current row for each item. A missing row becomes a
+// delete. A row-specific failure holds the batch until it has failed
+// RowAttempts times, after which the row is skipped and logged; every other
+// row is still fetched so their attempts are counted in the same poll.
+func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, error) {
+	out := make([]Mutation, 0, len(items))
+	var held error
+	for _, it := range items {
+		key := it.model + "/" + it.ref.ID
+		d, err := e.Source.Fetch(ctx, it.model, it.ref)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			if ctx.Err() != nil || errors.Is(err, ErrReset) || errors.Is(err, ErrUnavailable) {
+				return nil, err
+			}
+			if e.failures == nil {
+				e.failures = map[string]int{}
+			}
+			e.failures[key]++
+			if n := e.failures[key]; n >= RowAttempts {
+				log.Printf("sync.row_skipped model=%s model_id=%q attempts=%d err=%q", it.model, it.ref.ID, n, err)
+			} else if held == nil {
+				held = err
+			}
 			continue
 		}
+		delete(e.failures, key)
 		if err != nil {
-			return nil, err
+			out = append(out, Mutation{Doc: Doc{Source: e.Name, Model: it.model, ID: it.ref.ID, SyncID: it.syncID}, Delete: true})
+			continue
 		}
 		d.Source = e.Name
-		d.Model = model
-		d.ID = r.ID
-		d.SyncID = syncID
+		d.Model = it.model
+		d.ID = it.ref.ID
+		d.SyncID = it.syncID
 		out = append(out, Mutation{Doc: d})
+	}
+	if held != nil {
+		return nil, held
 	}
 	return out, nil
 }
@@ -155,7 +199,11 @@ func (e *Engine) rebuild(ctx context.Context) error {
 				c.Last = p.Max
 			}
 			c.Schema = schema
-			ms, err := e.mutations(ctx, model, p.Rows, p.Max)
+			items := make([]fetch, 0, len(p.Rows))
+			for _, r := range p.Rows {
+				items = append(items, fetch{model: model, ref: r, syncID: p.Max})
+			}
+			ms, err := e.mutations(ctx, items)
 			if err != nil {
 				return err
 			}
@@ -191,26 +239,42 @@ func (e *Engine) delta(ctx context.Context, shadow bool, c Cursor, publish bool)
 		if target < 0 {
 			target = d.Max
 		}
-		ms := make([]Mutation, 0, len(d.Changes))
+		// Rows resolve to their current state, so several events for one row in
+		// a page need one fetch. The row's last event decides between a delete
+		// and a fetch, and its sync ID is recorded.
+		type rowKey struct{ model, id string }
+		latest := map[rowKey]Change{}
+		order := []rowKey{}
 		last := c.Last
 		for _, ch := range d.Changes {
 			if ch.SyncID <= last || ch.SyncID > d.Last || !ValidModel(ch.Model) || ch.ID == "" {
 				return c, errors.New("invalid delta change")
 			}
-			last = ch.SyncID
-			switch ch.Action {
-			case "D":
-				ms = append(ms, Mutation{Doc: Doc{Source: e.Name, Model: ch.Model, ID: ch.ID, SyncID: ch.SyncID}, Delete: true})
-			case "I", "U":
-				xs, err := e.mutations(ctx, ch.Model, []Ref{{ID: ch.ID}}, ch.SyncID)
-				if err != nil {
-					return c, err
-				}
-				ms = append(ms, xs...)
-			default:
+			if ch.Action != "I" && ch.Action != "U" && ch.Action != "D" {
 				return c, fmt.Errorf("unknown change action %q", ch.Action)
 			}
+			last = ch.SyncID
+			k := rowKey{ch.Model, ch.ID}
+			if _, ok := latest[k]; !ok {
+				order = append(order, k)
+			}
+			latest[k] = ch
 		}
+		var deletes []Mutation
+		var items []fetch
+		for _, k := range order {
+			ch := latest[k]
+			if ch.Action == "D" {
+				deletes = append(deletes, Mutation{Doc: Doc{Source: e.Name, Model: ch.Model, ID: ch.ID, SyncID: ch.SyncID}, Delete: true})
+			} else {
+				items = append(items, fetch{model: ch.Model, ref: Ref{ID: ch.ID}, syncID: ch.SyncID})
+			}
+		}
+		ms, err := e.mutations(ctx, items)
+		if err != nil {
+			return c, err
+		}
+		ms = append(deletes, ms...)
 		if d.Last == c.Last && d.Last < target {
 			return c, errors.New("delta made no progress")
 		}

@@ -93,21 +93,28 @@ The source adapter consumes read-authenticated `GET /v1/sync/bootstrap` and
 `_metadata_` object. Truncated, unordered, unknown-model, and non-progressing
 feeds fail without advancing the committed cursor.
 
-Current rows are fetched from `/v1/documents/{key}`, `/v1/tasks/{id}`,
-and `/v1/tasks/{id}/comments`. Document IDs without a known key are resolved
-by walking every document bootstrap page. Comments and decisions are resolved
-by walking every task bootstrap page: comment lookup probes each task's
-`after_id` cursor, while decision lookup matches `refs.decision_request.id`.
-These complete scans work with the existing read APIs; they do not truncate
-at a list limit or silently treat an unavailable endpoint as deletion.
-Task refs and event notes, and decision questions and resolutions, are indexed.
-A racing row 404 removes stale indexed content; other errors preserve the
-cursor and retry next poll.
+Current rows are fetched one request per row. Documents, comments and
+decisions use `GET /v1/sync/rows/{model}/{model_id}`; decision IDs keep their
+slashes in the path. Tasks use `/v1/tasks/{id}`, because the raw task row
+lacks the event notes that are indexed. Task refs and event notes, and the
+whole decision request (question, options, resolution), are indexed. A 404
+carrying hk's `deleted` or `not_found` marker removes the indexed row; any
+other 404 means the endpoint is unavailable and never becomes a delete.
 
-Global-ID reads would make this much cheaper: v0 may need O(number of tasks)
-requests per comment or decision, and O(number of documents) identity scanning
-per document delta. Monitor sync lag on large sources. A future source lookup
-endpoint can replace the resolver without changing the engine or store.
+Within one delta page, events are coalesced per model and ID: the row's last
+event decides between a delete and one fetch of its current content.
+
+A fetch failure holds the cursor and retries next poll. When the same row
+fails on `RowAttempts` (3) consecutive polls with a row-specific error (for
+example a 500 or an undecodable or oversized body), it is logged as
+`sync.row_skipped` and left out of the page, which then commits with its
+cursor. The row keeps its previously indexed content until a later change or
+the daily rebuild fetches it; a rebuild skips it the same way. Source-wide
+failures (unreachable source, 401, 403, 429, 502, 503, 504, missing endpoint)
+are never skipped and always hold the cursor. Attempt counts live in memory:
+a restart grants a row fresh attempts, and `recallbeam rebuild` retries the
+rebuild up to `RowAttempts` times in one run. A row whose first failures occur
+during the daily rebuild delays that rebuild, not delta polling.
 
 Each delta page's mutations and cursor commit together. A database row lock
 serializes writers across processes, including manual rebuilds. Search keeps
