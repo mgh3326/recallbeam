@@ -87,8 +87,10 @@ func run() error {
 	if mode == "rebuild" {
 		// Attempt counts live in this process, so retry here: a row that keeps
 		// failing is skipped on the last attempt instead of failing every run.
+		// Only a held row or a schema reset is worth another pass; source and
+		// store errors are returned at once.
 		for i := 1; i <= core.RowAttempts; i++ {
-			if err = engine.Tick(ctx, true); err == nil || ctx.Err() != nil {
+			if err = engine.Tick(ctx, true); err == nil || ctx.Err() != nil || !(errors.Is(err, core.ErrRowHeld) || errors.Is(err, core.ErrReset)) {
 				break
 			}
 		}

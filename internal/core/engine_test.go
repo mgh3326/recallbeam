@@ -1,10 +1,13 @@
 package core_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/mgh3326/recallbeam/internal/core"
@@ -353,5 +356,120 @@ func TestRebuildSkipsRowThatKeepsFailing(t *testing.T) {
 	}
 	if m.active != 1 || len(m.docs[1]) != 1 || m.docs[1]["document/ok"].Body != "current" {
 		t.Fatalf("bad rebuild %+v", m)
+	}
+}
+func TestRebuildAttemptsRowsOnLaterPagesInSameRun(t *testing.T) {
+	m := newMemory()
+	seed(m)
+	attempts := map[string]int{}
+	s := source{bootstrap: func(model, cursor string) (core.Page, error) {
+		if model != "document" {
+			return core.Page{Max: 10, Schema: 1}, nil
+		}
+		if cursor == "" {
+			return core.Page{Rows: []core.Ref{{ID: "bad1", Key: "k1"}}, Next: "p2", Max: 10, Schema: 1}, nil
+		}
+		return core.Page{Rows: []core.Ref{{ID: "bad2", Key: "k2"}}, Max: 10, Schema: 1}, nil
+	}, delta: func(int64) (core.Delta, error) {
+		return core.Delta{Metadata: core.Metadata{Last: 10, Max: 10, Schema: 1}}, nil
+	}, fetch: func(_ string, r core.Ref) (core.Doc, error) {
+		attempts[r.ID]++
+		return core.Doc{}, errors.New("hk status 500")
+	}}
+	e := core.Engine{Source: s, Store: m, Name: "hk"}
+	for i := 1; i < core.RowAttempts; i++ {
+		if e.Tick(t.Context(), true) == nil || m.active != 0 {
+			t.Fatal("rebuild published while a row was still held")
+		}
+	}
+	if err := e.Tick(t.Context(), true); err != nil {
+		t.Fatal(err)
+	}
+	if attempts["bad2"] != core.RowAttempts {
+		t.Fatalf("row on a later page got %d attempts, want %d", attempts["bad2"], core.RowAttempts)
+	}
+}
+func TestSkippedRowGetsFreshBudgetAfterItsPageCommits(t *testing.T) {
+	m := newMemory()
+	seed(m)
+	s := source{delta: func(a int64) (core.Delta, error) {
+		if a == 10 {
+			return core.Delta{Changes: []core.Change{{SyncID: 11, Model: "task", ID: "bad", Action: "U"}}, Metadata: core.Metadata{Last: 11, Max: 11, Schema: 1}}, nil
+		}
+		return core.Delta{Changes: []core.Change{{SyncID: 12, Model: "task", ID: "bad", Action: "U"}}, Metadata: core.Metadata{Last: 12, Max: 12, Schema: 1}}, nil
+	}, fetch: func(string, core.Ref) (core.Doc, error) { return core.Doc{}, errors.New("hk status 500") }}
+	e := core.Engine{Source: s, Store: m, Name: "hk"}
+	for i := 1; i < core.RowAttempts; i++ {
+		if e.Tick(t.Context(), false) == nil || m.cursors[0].Last != 10 {
+			t.Fatalf("attempt %d: row failure must hold the cursor before the limit", i)
+		}
+	}
+	if err := e.Tick(t.Context(), false); err != nil || m.cursors[0].Last != 11 {
+		t.Fatalf("skipped row must let its page commit: %v %+v", err, m.cursors[0])
+	}
+	if e.Tick(t.Context(), false) == nil || m.cursors[0].Last != 11 {
+		t.Fatal("one failure after a committed skip skipped the row again")
+	}
+}
+func TestDeletedRowLosesItsFailureCount(t *testing.T) {
+	m := newMemory()
+	seed(m)
+	page := func(sync int64, action string) core.Delta {
+		return core.Delta{Changes: []core.Change{{SyncID: sync, Model: "task", ID: "bad", Action: action}}, Metadata: core.Metadata{Last: sync, Max: sync, Schema: 1}}
+	}
+	pages := []core.Delta{page(11, "U"), page(11, "U"), page(12, "D"), page(13, "I")}
+	s := source{delta: func(a int64) (core.Delta, error) {
+		if len(pages) == 0 {
+			return core.Delta{Metadata: core.Metadata{Last: a, Max: a, Schema: 1}}, nil
+		}
+		d := pages[0]
+		pages = pages[1:]
+		return d, nil
+	}, fetch: func(string, core.Ref) (core.Doc, error) { return core.Doc{}, errors.New("hk status 500") }}
+	e := core.Engine{Source: s, Store: m, Name: "hk"}
+	for i := 1; i < core.RowAttempts; i++ {
+		if e.Tick(t.Context(), false) == nil {
+			t.Fatal("expected hold")
+		}
+	}
+	if err := e.Tick(t.Context(), false); err != nil || m.cursors[0].Last != 12 {
+		t.Fatalf("delete must commit: %v %+v", err, m.cursors[0])
+	}
+	if e.Tick(t.Context(), false) == nil || m.cursors[0].Last != 12 {
+		t.Fatal("re-created row was skipped on its first failure")
+	}
+}
+func TestSkipIsLoggedOnlyWhenItsPageCommits(t *testing.T) {
+	var logs bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(old)
+	m := newMemory()
+	seed(m)
+	tick := 0
+	s := source{delta: func(int64) (core.Delta, error) {
+		return core.Delta{Changes: []core.Change{{SyncID: 11, Model: "task", ID: "bad", Action: "U"}, {SyncID: 12, Model: "task", ID: "late", Action: "U"}}, Metadata: core.Metadata{Last: 12, Max: 12, Schema: 1}}, nil
+	}, fetch: func(_ string, r core.Ref) (core.Doc, error) {
+		if r.ID == "bad" || (r.ID == "late" && tick == core.RowAttempts) {
+			return core.Doc{}, errors.New("hk status 500")
+		}
+		return core.Doc{Body: "current"}, nil
+	}}
+	e := core.Engine{Source: s, Store: m, Name: "hk"}
+	for i := 1; i <= core.RowAttempts; i++ {
+		tick = i
+		if e.Tick(t.Context(), false) == nil || m.cursors[0].Last != 10 {
+			t.Fatalf("tick %d: a page with a held row must not commit", i)
+		}
+	}
+	if strings.Contains(logs.String(), "sync.row_skipped") {
+		t.Fatalf("skip logged for a page that did not commit: %q", logs.String())
+	}
+	tick++
+	if err := e.Tick(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), `model_id="bad"`) {
+		t.Fatalf("committed skip not logged: %q", logs.String())
 	}
 }

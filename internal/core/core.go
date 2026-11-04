@@ -20,6 +20,11 @@ var ErrNotFound = errors.New("source row missing")
 // failures always hold the cursor; only row-specific failures can be skipped.
 var ErrUnavailable = errors.New("source unavailable")
 
+// ErrRowHeld marks a row-specific fetch failure that has not yet reached
+// RowAttempts. The page holds; a later run may fetch the row successfully or
+// reach the limit.
+var ErrRowHeld = errors.New("row fetch failed before attempt limit")
+
 // RowAttempts is how many polls one row may fail to fetch before the engine
 // leaves it out of its page so the cursor can advance. The skipped row keeps
 // its previously indexed content until a later change or the daily rebuild
@@ -131,28 +136,38 @@ type fetch struct {
 	syncID int64
 }
 
+// skip is a row that reached RowAttempts failed fetches. It is left out of its
+// page. The caller reports it only once the page commits.
+type skip struct {
+	key, model, id string
+	attempts       int
+	err            error
+}
+
 // mutations fetches the current row for each item. A missing row becomes a
 // delete. A row-specific failure holds the batch until it has failed
-// RowAttempts times, after which the row is skipped and logged; every other
-// row is still fetched so their attempts are counted in the same poll.
-func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, error) {
+// RowAttempts times, after which the row is skipped; every other row is still
+// fetched so their attempts are counted in the same poll. A held batch returns
+// ErrRowHeld and no mutations.
+func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, []skip, error) {
 	out := make([]Mutation, 0, len(items))
+	var skips []skip
 	var held error
 	for _, it := range items {
 		key := it.model + "/" + it.ref.ID
 		d, err := e.Source.Fetch(ctx, it.model, it.ref)
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			if ctx.Err() != nil || errors.Is(err, ErrReset) || errors.Is(err, ErrUnavailable) {
-				return nil, err
+				return nil, nil, err
 			}
 			if e.failures == nil {
 				e.failures = map[string]int{}
 			}
 			e.failures[key]++
 			if n := e.failures[key]; n >= RowAttempts {
-				log.Printf("sync.row_skipped model=%s model_id=%q attempts=%d err=%q", it.model, it.ref.ID, n, err)
+				skips = append(skips, skip{key: key, model: it.model, id: it.ref.ID, attempts: n, err: err})
 			} else if held == nil {
-				held = err
+				held = fmt.Errorf("%w: %w", ErrRowHeld, err)
 			}
 			continue
 		}
@@ -168,16 +183,32 @@ func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, erro
 		out = append(out, Mutation{Doc: d})
 	}
 	if held != nil {
-		return nil, held
+		return nil, nil, held
 	}
-	return out, nil
+	return out, skips, nil
 }
+
+// settle reports the rows that a committed page skipped. A live commit also
+// clears their counts, so the row's next change starts with a full budget. A
+// rebuild keeps them, so the retries of one rebuild still skip the row.
+func (e *Engine) settle(skips []skip, live bool) {
+	for _, s := range skips {
+		log.Printf("sync.row_skipped model=%s model_id=%q attempts=%d err=%q", s.model, s.id, s.attempts, s.err)
+		if live {
+			delete(e.failures, s.key)
+		}
+	}
+}
+
 func (e *Engine) rebuild(ctx context.Context) error {
 	if err := e.Store.Reset(ctx); err != nil {
 		return err
 	}
 	c := Cursor{Last: -1}
 	schema := 0
+	// A page with a held row is not written, but the scan continues so every
+	// row failing in this run gets its attempt. The rebuild then fails unpublished.
+	var held error
 	for _, model := range Models {
 		next := ""
 		seen := map[string]bool{}
@@ -203,12 +234,19 @@ func (e *Engine) rebuild(ctx context.Context) error {
 			for _, r := range p.Rows {
 				items = append(items, fetch{model: model, ref: r, syncID: p.Max})
 			}
-			ms, err := e.mutations(ctx, items)
-			if err != nil {
+			ms, skips, err := e.mutations(ctx, items)
+			switch {
+			case errors.Is(err, ErrRowHeld):
+				if held == nil {
+					held = err
+				}
+			case err != nil:
 				return err
-			}
-			if err = e.Store.Apply(ctx, true, ms, c, false); err != nil {
-				return err
+			default:
+				if err = e.Store.Apply(ctx, true, ms, c, false); err != nil {
+					return err
+				}
+				e.settle(skips, false)
 			}
 			if p.Next == "" {
 				break
@@ -219,6 +257,9 @@ func (e *Engine) rebuild(ctx context.Context) error {
 			seen[p.Next] = true
 			next = p.Next
 		}
+	}
+	if held != nil {
+		return held
 	}
 	_, err := e.delta(ctx, true, c, true)
 	return err
@@ -265,12 +306,13 @@ func (e *Engine) delta(ctx context.Context, shadow bool, c Cursor, publish bool)
 		for _, k := range order {
 			ch := latest[k]
 			if ch.Action == "D" {
+				delete(e.failures, ch.Model+"/"+ch.ID)
 				deletes = append(deletes, Mutation{Doc: Doc{Source: e.Name, Model: ch.Model, ID: ch.ID, SyncID: ch.SyncID}, Delete: true})
 			} else {
 				items = append(items, fetch{model: ch.Model, ref: Ref{ID: ch.ID}, syncID: ch.SyncID})
 			}
 		}
-		ms, err := e.mutations(ctx, items)
+		ms, skips, err := e.mutations(ctx, items)
 		if err != nil {
 			return c, err
 		}
@@ -283,6 +325,7 @@ func (e *Engine) delta(ctx context.Context, shadow bool, c Cursor, publish bool)
 		if err = e.Store.Apply(ctx, shadow, ms, c, publish && done); err != nil {
 			return c, err
 		}
+		e.settle(skips, !shadow)
 		if done {
 			return c, nil
 		}

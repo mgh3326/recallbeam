@@ -140,6 +140,32 @@ func TestFetchResolvesRowsDirectly(t *testing.T) {
 	}
 }
 
+// A connection that dies mid-body is a source fault, not a bad row.
+func TestTruncatedRowBodyIsSourceUnavailable(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "1000")
+		fmt.Fprint(w, `{"id":7`)
+	}))
+	defer server.Close()
+	_, err := Client{Base: server.URL}.Fetch(t.Context(), "document", core.Ref{ID: "7"})
+	if !errors.Is(err, core.ErrUnavailable) {
+		t.Fatalf("truncated body must hold the cursor as a source outage: %v", err)
+	}
+}
+
+func TestDecisionWithoutQuestionKeepsFallbackTitle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":"req/x","key":"decision/req-x","updated_at":"2026-01-01T00:00:00+00:00"}`)
+	}))
+	defer server.Close()
+	d, err := Client{Base: server.URL}.Fetch(t.Context(), "decision", core.Ref{ID: "req/x"})
+	if err != nil || d.Title != "decision/req-x" {
+		t.Fatalf("decision without question lost its title fallback: %+v %v", d, err)
+	}
+}
+
 func TestSourceWideFailuresAreUnavailable(t *testing.T) {
 	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(status) }))
