@@ -194,7 +194,7 @@ func (c Client) Fetch(ctx context.Context, model string, ref core.Ref) (core.Doc
 	defer r.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxRow+1))
 	if err != nil {
-		return d, err
+		return d, fmt.Errorf("hk read failed: %w", core.ErrUnavailable)
 	}
 	if len(body) > maxRow {
 		return d, errors.New("hk row exceeds 16 MiB")
@@ -229,7 +229,9 @@ func (c Client) Fetch(ctx context.Context, model string, ref core.Ref) (core.Doc
 		d.Identifier = taskIdentifier.FindString(d.Title)
 	case "decision":
 		// The whole request is indexed: question, options and resolution.
-		d.Title = raw.Question
+		if raw.Question != "" {
+			d.Title = raw.Question
+		}
 		d.Body = string(body)
 	}
 	if strings.HasPrefix(d.Key, "linear/") {
