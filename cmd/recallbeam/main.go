@@ -85,7 +85,16 @@ func run() error {
 	}
 	engine := &core.Engine{Store: st, Source: hk.Client{Base: os.Getenv("RB_HK_URL"), Token: os.Getenv("RB_HK_TOKEN")}, Name: "hk"}
 	if mode == "rebuild" {
-		if err = engine.Tick(ctx, true); err != nil {
+		// Attempt counts live in this process, so retry here: a row that keeps
+		// failing is skipped on the last attempt instead of failing every run.
+		// Only a held row or a schema reset is worth another pass; source and
+		// store errors are returned at once.
+		for i := 1; i <= core.RowAttempts; i++ {
+			if err = engine.Tick(ctx, true); err == nil || ctx.Err() != nil || !(errors.Is(err, core.ErrRowHeld) || errors.Is(err, core.ErrReset)) {
+				break
+			}
+		}
+		if err != nil {
 			return errors.New("rebuild failed; publication outcome may be unknown; rerun rebuild")
 		}
 		return nil

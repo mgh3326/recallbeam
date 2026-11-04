@@ -18,7 +18,11 @@ import (
 	"github.com/mgh3326/recallbeam/internal/core"
 )
 
-var errReadEndpoint = errors.New("hk read endpoint unavailable")
+// A 404 without hk's not-found or deleted marker means the route is missing,
+// not the row; it must never become a delete.
+var errReadEndpoint = fmt.Errorf("hk read endpoint unavailable: %w", core.ErrUnavailable)
+
+const maxRow = 16 << 20
 
 type Client struct {
 	Base, Token string
@@ -45,7 +49,7 @@ func (c Client) get(ctx context.Context, path string) (*http.Response, error) {
 
 	r, err := client.Do(req)
 	if err != nil {
-		return nil, errors.New("hk request failed")
+		return nil, fmt.Errorf("hk request failed: %w", core.ErrUnavailable)
 	}
 	if r.StatusCode != http.StatusOK {
 		defer r.Body.Close()
@@ -54,12 +58,15 @@ func (c Client) get(ctx context.Context, path string) (*http.Response, error) {
 			return nil, core.ErrReset
 		case http.StatusNotFound:
 			var problem struct {
-				Error string `json:"error"`
+				Error   string `json:"error"`
+				Deleted bool   `json:"deleted"`
 			}
-			if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") && json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&problem) == nil && problem.Error == "not_found" {
+			if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") && json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&problem) == nil && (problem.Error == "not_found" || problem.Deleted) {
 				return nil, core.ErrNotFound
 			}
 			return nil, errReadEndpoint
+		case http.StatusUnauthorized, http.StatusForbidden, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return nil, fmt.Errorf("hk status %d: %w", r.StatusCode, core.ErrUnavailable)
 		}
 		return nil, fmt.Errorf("hk status %d", r.StatusCode)
 	}
@@ -127,20 +134,22 @@ func (c Client) Delta(ctx context.Context, after int64) (core.Delta, error) {
 	return d, nil
 }
 
-// Fetch reads current content through hk's existing read APIs.
+// Fetch reads one current row. Documents, comments and decisions come from
+// hk's /v1/sync/rows lookup. Tasks use /v1/tasks/{id}, a direct lookup too,
+// because the raw task row has no event notes and those are indexed.
 func (c Client) Fetch(ctx context.Context, model string, ref core.Ref) (core.Doc, error) {
 	var d core.Doc
 	var path string
 	switch model {
-	case "document":
-		if ref.Key == "" {
-			return c.resolve(ctx, model, ref)
-		}
-		path = "/v1/documents/" + url.PathEscape(ref.Key)
 	case "task":
 		path = "/v1/tasks/" + url.PathEscape(ref.ID)
-	case "task_comment", "decision":
-		return c.resolve(ctx, model, ref)
+	case "document", "task_comment", "decision":
+		// The model ID consumes the rest of the path; decision IDs may contain slashes.
+		parts := strings.Split(ref.ID, "/")
+		for i, p := range parts {
+			parts[i] = url.PathEscape(p)
+		}
+		path = "/v1/sync/rows/" + model + "/" + strings.Join(parts, "/")
 	default:
 		return d, errors.New("unknown model")
 	}
@@ -150,14 +159,21 @@ func (c Client) Fetch(ctx context.Context, model string, ref core.Ref) (core.Doc
 		return d, err
 	}
 	defer r.Body.Close()
-	var raw struct {
-		Key, Title, Body, Kind string
-		UpdatedAt              time.Time       `json:"updated_at"`
-		CreatedAt              time.Time       `json:"created_at"`
-		Refs                   json.RawMessage `json:"refs"`
-		Events                 json.RawMessage `json:"events"`
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRow+1))
+	if err != nil {
+		return d, fmt.Errorf("hk read failed: %w", core.ErrUnavailable)
 	}
-	if err = json.NewDecoder(io.LimitReader(r.Body, 16<<20)).Decode(&raw); err != nil {
+	if len(body) > maxRow {
+		return d, errors.New("hk row exceeds 16 MiB")
+	}
+	var raw struct {
+		Key, Title, Body, Kind, Question string
+		UpdatedAt                        time.Time       `json:"updated_at"`
+		CreatedAt                        time.Time       `json:"created_at"`
+		Refs                             json.RawMessage `json:"refs"`
+		Events                           json.RawMessage `json:"events"`
+	}
+	if err = json.Unmarshal(body, &raw); err != nil {
 		return d, err
 	}
 	d.Key = raw.Key
@@ -171,14 +187,19 @@ func (c Client) Fetch(ctx context.Context, model string, ref core.Ref) (core.Doc
 	if d.Title == "" {
 		d.Title = d.Key
 	}
-	if model == "task" {
+	switch model {
+	case "task":
 		d.Body = string(raw.Refs) + "\n" + string(raw.Events)
+		d.Identifier = taskIdentifier.FindString(d.Title)
+	case "decision":
+		// The whole request is indexed: question, options and resolution.
+		if raw.Question != "" {
+			d.Title = raw.Question
+		}
+		d.Body = string(body)
 	}
 	if strings.HasPrefix(d.Key, "linear/") {
 		d.Identifier = strings.TrimPrefix(d.Key, "linear/")
-	}
-	if model == "task" {
-		d.Identifier = taskIdentifier.FindString(d.Title)
 	}
 	return d, nil
 }
