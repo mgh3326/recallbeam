@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/mgh3326/recallbeam/migrations"
 )
 
 func TestKeepaliveContinuesAfterFailureAndStops(t *testing.T) {
@@ -50,5 +52,14 @@ func TestListenAddressPreservesOverride(t *testing.T) {
 	t.Setenv("RB_LISTEN_ADDR", ":9090")
 	if got := listenAddress(); got != ":9090" {
 		t.Fatal(got)
+	}
+}
+
+func TestGenerationIsStableAndCoversMigrations(t *testing.T) {
+	if g := generation(); g <= 0 || g != generation() {
+		t.Fatal("generation must be positive and stable across calls")
+	}
+	if migrations.Digest() == "" || migrations.Digest() != migrations.Digest() {
+		t.Fatal("migration digest must be stable")
 	}
 }

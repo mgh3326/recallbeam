@@ -24,7 +24,7 @@ func TestApplyCommitsDeleteAndCursorTogether(t *testing.T) {
 	m.ExpectExec("DELETE FROM rb_docs_a").WithArgs("hk", "task", "1").WillReturnResult(sqlmock.NewResult(0, 1))
 	m.ExpectExec("MERGE INTO rb_cursor_a").WithArgs("hk", 11, 1).WillReturnResult(sqlmock.NewResult(0, 1))
 	m.ExpectCommit()
-	err = s.Apply(t.Context(), false, []core.Mutation{{Doc: core.Doc{Source: "hk", Model: "task", ID: "1"}, Delete: true}}, core.Cursor{Last: 11, Schema: 1}, false)
+	err = s.Apply(t.Context(), false, []core.Mutation{{Doc: core.Doc{Source: "hk", Model: "task", ID: "1"}, Delete: true}}, core.Cursor{Last: 11, Generation: 1}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +41,7 @@ func TestApplyCursorFailureRollsBackRows(t *testing.T) {
 	m.ExpectExec("DELETE FROM rb_docs_a").WillReturnResult(sqlmock.NewResult(0, 1))
 	m.ExpectExec("MERGE INTO rb_cursor_a").WillReturnError(errors.New("disk failure"))
 	m.ExpectRollback()
-	if s.Apply(t.Context(), false, []core.Mutation{{Doc: core.Doc{Source: "hk", Model: "task", ID: "1"}, Delete: true}}, core.Cursor{Last: 11, Schema: 1}, false) == nil {
+	if s.Apply(t.Context(), false, []core.Mutation{{Doc: core.Doc{Source: "hk", Model: "task", ID: "1"}, Delete: true}}, core.Cursor{Last: 11, Generation: 1}, false) == nil {
 		t.Fatal("expected failure")
 	}
 	if err := m.ExpectationsWereMet(); err != nil {
@@ -63,7 +63,7 @@ func TestPublishCommitsCursorAndPointerTogether(t *testing.T) {
 			ex.WillReturnResult(sqlmock.NewResult(0, 1))
 			m.ExpectCommit()
 		}
-		err := s.Apply(t.Context(), true, nil, core.Cursor{Last: 10, Schema: 1}, true)
+		err := s.Apply(t.Context(), true, nil, core.Cursor{Last: 10, Generation: 1}, true)
 		if (err != nil) != fail {
 			t.Fatal(err)
 		}
@@ -115,7 +115,7 @@ func TestUpsertUsesMergeWithLOBsAndAtomicCursor(t *testing.T) {
 		m.ExpectExec("MERGE INTO rb_docs_a.*WHEN MATCHED THEN UPDATE.*WHEN NOT MATCHED THEN INSERT").WithArgs("hk", "task", "1", "ROB-1", "title", "body", "tag", at, 11, "title\nbody", "ROB-1").WillReturnResult(sqlmock.NewResult(0, 1))
 		m.ExpectExec("MERGE INTO rb_cursor_a").WillReturnResult(sqlmock.NewResult(0, 1))
 		m.ExpectCommit()
-		err = s.Apply(t.Context(), false, []core.Mutation{{Doc: core.Doc{Source: "hk", Model: "task", ID: "1", Key: "ROB-1", Identifier: "ROB-1", Title: "title", Body: "body", Tags: "tag", UpdatedAt: at, SyncID: 11}}}, core.Cursor{Last: 11, Schema: 1}, false)
+		err = s.Apply(t.Context(), false, []core.Mutation{{Doc: core.Doc{Source: "hk", Model: "task", ID: "1", Key: "ROB-1", Identifier: "ROB-1", Title: "title", Body: "body", Tags: "tag", UpdatedAt: at, SyncID: 11}}}, core.Cursor{Last: 11, Generation: 1}, false)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -83,7 +83,7 @@ func run() error {
 	if err = required("RB_HK_URL", "RB_HK_TOKEN"); err != nil {
 		return err
 	}
-	engine := &core.Engine{Store: st, Source: hk.Client{Base: os.Getenv("RB_HK_URL"), Token: os.Getenv("RB_HK_TOKEN")}, Name: "hk"}
+	engine := &core.Engine{Store: st, Source: hk.Client{Base: os.Getenv("RB_HK_URL"), Token: os.Getenv("RB_HK_TOKEN")}, Name: "hk", Generation: generation()}
 	if mode == "rebuild" {
 		// Attempt counts live in this process, so retry here: a row that keeps
 		// failing is skipped on the last attempt instead of failing every run.
@@ -152,6 +152,12 @@ func loop(ctx context.Context, e *core.Engine, st *oracle.Store, interval time.D
 			sync(true)
 		}
 	}
+}
+
+// generation keys the index to recallbeam's own extraction and index settings,
+// never to the source's schema version.
+func generation() int64 {
+	return core.Generation(fmt.Sprintf("hk extract %d", hk.ExtractVersion), fmt.Sprintf("oracle text %d", oracle.TextVersion), "migrations "+migrations.Digest())
 }
 
 func keepalive(ctx context.Context, interval time.Duration, query func(context.Context) error) {

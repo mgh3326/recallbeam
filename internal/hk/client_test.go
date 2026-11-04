@@ -1,6 +1,9 @@
 package hk
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -28,9 +31,9 @@ func TestFakeHKBootstrapDeltaAndFetch(t *testing.T) {
 			fmt.Fprintln(w, `{"sync_id":43,"model":"document","model_id":"7","action":"U","at":"2026-01-01T00:00:00Z"}`)
 			fmt.Fprintln(w, `{"_metadata_":{"last_sync_id":43,"max_sync_id":43,"schema_version":1}}`)
 		case "/v1/sync/rows/document/7":
-			fmt.Fprint(w, `{"id":7,"key":"design/a","body":"한국어","updated_at":"2026-01-01T00:00:00.123456+09:00"}`)
+			fmt.Fprint(w, `{"id":7,"key":"design/a","kind":"note","body":"한국어","updated_at":"2026-01-01T00:00:00.123456+09:00"}`)
 		case "/v1/tasks/9":
-			fmt.Fprint(w, `{"id":9,"title":"Task","refs":{"linear":{"brief":"details"}},"events":[{"note":"done"}]}`)
+			fmt.Fprint(w, `{"id":9,"title":"Task","refs":{"linear":{"brief":"details"}},"events":[{"note":"done"}],"updated_at":"2026-01-01T00:00:00Z"}`)
 		case "/v1/sync/rows/task_comment/3":
 			fmt.Fprint(w, `{"id":3,"body":"comment","created_at":"2026-01-01T00:00:00Z"}`)
 		default:
@@ -155,9 +158,11 @@ func TestTruncatedRowBodyIsSourceUnavailable(t *testing.T) {
 }
 
 func TestDecisionWithoutQuestionKeepsFallbackTitle(t *testing.T) {
+	// hk always emits the question key (store.DecisionRequest has no omitempty);
+	// an unanswered one is the empty string, which keeps the key as the title.
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"req/x","key":"decision/req-x","updated_at":"2026-01-01T00:00:00+00:00"}`)
+		fmt.Fprint(w, `{"id":"req/x","key":"decision/req-x","question":"","updated_at":"2026-01-01T00:00:00+00:00"}`)
 	}))
 	defer server.Close()
 	d, err := Client{Base: server.URL}.Fetch(t.Context(), "decision", core.Ref{ID: "req/x"})
@@ -247,5 +252,68 @@ func TestSourceHTTPSDoesNotRedirectCredentials(t *testing.T) {
 	}
 	if injected.CheckRedirect != nil {
 		t.Fatal("mutated caller's HTTP client")
+	}
+}
+
+// extractionFixture serves one representative row per model.
+func extractionFixture(t *testing.T, rows map[string]string) Client {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := rows[r.URL.EscapedPath()]
+		if !ok {
+			t.Errorf("unexpected request %s", r.URL)
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(server.Close)
+	return Client{Base: server.URL}
+}
+
+var extractionRows = map[string]string{
+	"/v1/sync/rows/document/7":     `{"id":7,"key":"linear/MGH-1","kind":"note","session":"s","job":"","body":"문서 body","sha256":"x","created_by":"a","created_at":"2026-01-01T00:00:00+00:00","updated_at":"2026-01-02T00:00:00+00:00"}`,
+	"/v1/tasks/9":                  `{"id":9,"lane":"l","title":"MGH-9 Task","kind":"implement","state":"backlog","refs":{"brief":"details"},"created_by":"a","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","events":[{"note":"done"}]}`,
+	"/v1/sync/rows/task_comment/3": `{"id":3,"task_id":9,"body":"comment","author":"a","created_at":"2026-01-01T00:00:00+00:00"}`,
+	"/v1/sync/rows/decision/d-1":   `{"id":"d-1","question":"Which?","resolution":{"reason":"chosen"},"task_id":9,"updated_at":"2026-01-02T00:00:00+00:00","options":[{"key":"a"}]}`,
+}
+
+// Indexed fields feed core.Generation through ExtractVersion. When this
+// fails, the extraction changed: bump ExtractVersion and pin the new digest.
+func TestExtractionPinsVersion(t *testing.T) {
+	pinned := map[int]string{1: "6aed6d04befe738b0f4bcc273162d23aceac1449adb84a64f9cba5a878e54276"}
+	c := extractionFixture(t, extractionRows)
+	h := sha256.New()
+	for _, tc := range []struct{ model, id string }{{"document", "7"}, {"task", "9"}, {"task_comment", "3"}, {"decision", "d-1"}} {
+		d, err := c.Fetch(t.Context(), tc.model, core.Ref{ID: tc.id})
+		if err != nil {
+			t.Fatal(tc.model, err)
+		}
+		b, _ := json.Marshal(d)
+		h.Write(append(b, '\n'))
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if want, ok := pinned[ExtractVersion]; !ok || want != got {
+		t.Fatalf("extraction output changed (digest %s): bump ExtractVersion so the index rebuilds, and pin the digest under the new version", got)
+	}
+}
+
+func TestIncompatibleRowShapeFailsLoud(t *testing.T) {
+	for path, body := range map[string]string{
+		"/v1/sync/rows/document/7":     `{"id":7,"key":"k","kind":"note","content":"renamed","updated_at":"2026-01-01T00:00:00Z"}`,
+		"/v1/sync/rows/task_comment/3": `{"id":3,"body":{"text":"retyped"},"created_at":"2026-01-01T00:00:00Z"}`,
+		"/v1/sync/rows/decision/d-1":   `{"id":"d-1","question":null,"updated_at":"2026-01-01T00:00:00Z"}`,
+		"/v1/tasks/9":                  `{"id":9,"title":"t","refs":"{}","updated_at":"2026-01-01T00:00:00Z"}`,
+	} {
+		parts := strings.Split(path, "/")
+		model, id := parts[len(parts)-2], parts[len(parts)-1]
+		if model == "tasks" {
+			model = "task"
+		}
+		c := extractionFixture(t, map[string]string{path: body})
+		_, err := c.Fetch(t.Context(), model, core.Ref{ID: id})
+		if !errors.Is(err, core.ErrIncompatible) {
+			t.Fatalf("%s: %v", model, err)
+		}
 	}
 }

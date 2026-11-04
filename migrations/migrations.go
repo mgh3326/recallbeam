@@ -2,14 +2,30 @@ package migrations
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"strings"
 )
 
 //go:embed *.sql
 var Files embed.FS
+
+// Digest hashes every embedded migration, including the Oracle Text lexer,
+// stoplist and index parameters. It is an input to core.Generation.
+func Digest() string {
+	h := sha256.New()
+	names, _ := fs.Glob(Files, "*.sql")
+	for _, n := range names {
+		b, _ := Files.ReadFile(n)
+		fmt.Fprintf(h, "%s %d\n", n, len(b))
+		h.Write(b)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
 
 // Run is an explicit operator command. Oracle DDL commits implicitly: a failed
 // migration requires operator inspection before retrying, never an automatic loop.

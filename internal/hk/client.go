@@ -2,6 +2,7 @@ package hk
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,38 @@ import (
 var errReadEndpoint = fmt.Errorf("hk read endpoint unavailable: %w", core.ErrUnavailable)
 
 const maxRow = 16 << 20
+
+// ExtractVersion names how Fetch maps source rows to indexed fields. Bump it
+// with any change to that mapping; it is an input to core.Generation, so the
+// next start rebuilds the index. TestExtractionPinsVersion enforces the bump.
+const ExtractVersion = 1
+
+// rowShape lists, per model, the fields Fetch reads and their JSON kind.
+// hk serves raw database rows (to_jsonb emits every column, NULLs included)
+// and API structs that always emit these keys, so a missing or retyped field
+// means an hk migration changed the shape for the whole model.
+var rowShape = map[string]map[string]byte{
+	"document":     {"key": '"', "body": '"', "kind": '"', "updated_at": '"'},
+	"task":         {"title": '"', "refs": '{', "updated_at": '"'},
+	"task_comment": {"body": '"', "created_at": '"'},
+	"decision":     {"question": '"', "updated_at": '"'},
+}
+
+// checkShape rejects a row the extractor cannot read faithfully, instead of
+// indexing empty text for a renamed field.
+func checkShape(model string, body []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return err
+	}
+	for name, kind := range rowShape[model] {
+		v := bytes.TrimSpace(fields[name])
+		if len(v) == 0 || v[0] != kind {
+			return fmt.Errorf("hk %s field %q missing or not %s: %w", model, name, map[byte]string{'"': "a string", '{': "an object"}[kind], core.ErrIncompatible)
+		}
+	}
+	return nil
+}
 
 type Client struct {
 	Base, Token string
@@ -165,6 +198,9 @@ func (c Client) Fetch(ctx context.Context, model string, ref core.Ref) (core.Doc
 	}
 	if len(body) > maxRow {
 		return d, errors.New("hk row exceeds 16 MiB")
+	}
+	if err = checkShape(model, body); err != nil {
+		return d, err
 	}
 	var raw struct {
 		Key, Title, Body, Kind, Question string
