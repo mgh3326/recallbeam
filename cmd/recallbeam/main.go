@@ -170,7 +170,7 @@ func loop(ctx context.Context, e *core.Engine, st *oracle.Store, interval time.D
 // generation keys the index to recallbeam's own extraction and index settings,
 // never to the source's schema version.
 func generation() int64 {
-	return core.Generation(fmt.Sprintf("hk extract %d", hk.ExtractVersion), fmt.Sprintf("oracle text %d", oracle.TextVersion), "migrations "+migrations.Digest())
+	return core.Generation(fmt.Sprintf("hk extract %d", hk.ExtractVersion), "hk excluded "+strings.Join(hk.ExcludedDocumentPrefixes, ","), fmt.Sprintf("oracle text %d", oracle.TextVersion), "migrations "+migrations.Digest())
 }
 
 func keepalive(ctx context.Context, interval time.Duration, query func(context.Context) error) {

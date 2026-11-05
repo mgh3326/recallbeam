@@ -15,6 +15,23 @@ import (
 )
 
 var Models = []string{"document", "task", "task_comment", "decision"}
+
+// IndexedModels are the Models the index holds. A change to a model outside
+// it moves the cursor and is otherwise ignored. Task comments are left out
+// (hk:doc decision/2026-11-05/hk-work-record-model: mostly machine notes).
+// The list is part of Generation, so changing it rebuilds the index.
+var IndexedModels = []string{"document", "task", "decision"}
+
+// Indexed reports whether model m is in IndexedModels.
+func Indexed(m string) bool {
+	for _, v := range IndexedModels {
+		if m == v {
+			return true
+		}
+	}
+	return false
+}
+
 var ErrReset = errors.New("source requires bootstrap")
 var ErrNotFound = errors.New("source row missing")
 
@@ -101,7 +118,7 @@ type Cursor struct {
 // version is deliberately not an input; row shape is checked on each fetch.
 func Generation(parts ...string) int64 {
 	h := sha256.New()
-	for _, m := range Models {
+	for _, m := range IndexedModels {
 		fmt.Fprintf(h, "model %q\n", m)
 	}
 	for _, p := range parts {
@@ -190,7 +207,13 @@ type skip struct {
 // fetched so their attempts are counted in the same poll. A held batch returns
 // ErrRowHeld and no mutations.
 func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, []skip, error) {
-	results := e.fetchAll(ctx, items)
+	results, batch := e.fetchAll(ctx, items)
+	if batch != nil {
+		if errors.Is(batch, ErrIncompatible) {
+			log.Printf("sync.row_incompatible err=%q", batch)
+		}
+		return nil, nil, batch
+	}
 	out := make([]Mutation, 0, len(items))
 	var skips []skip
 	var held error
@@ -238,54 +261,74 @@ type fetched struct {
 }
 
 // fetchAll fetches every item, at most FetchConcurrency at once, and returns
-// the results in item order. A source-wide failure cancels the fetches not
-// yet started; mutations then returns that failure, as it did when fetching
-// one at a time.
-func (e *Engine) fetchAll(ctx context.Context, items []fetch) []fetched {
+// the results in item order. A source-wide failure stops the page: fetches
+// not yet started are not run, and the failure itself is returned as the
+// batch error. Fetches cut short by that cancellation are not row failures,
+// so they never count against a row's attempts. When fetches fail
+// source-wide at the same time, ErrReset wins, so the engine rebuilds.
+func (e *Engine) fetchAll(ctx context.Context, items []fetch) ([]fetched, error) {
 	out := make([]fetched, len(items))
 	n := e.FetchConcurrency
 	if n <= 1 {
 		for i, it := range items {
 			out[i].doc, out[i].err = e.Source.Fetch(ctx, it.model, it.ref)
-			if sourceWide(ctx, out[i].err) {
-				for j := i + 1; j < len(items); j++ {
-					out[j].err = out[i].err
-				}
-				break
+			if ctx.Err() != nil {
+				return out, ctx.Err()
+			}
+			if sourceWide(out[i].err) {
+				return out, out[i].err
 			}
 		}
-		return out
+		return out, nil
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	child, cancel := context.WithCancel(ctx)
 	defer cancel()
+	var mu sync.Mutex
+	var batch error
+	record := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if batch == nil || (errors.Is(err, ErrReset) && !errors.Is(batch, ErrReset)) {
+			batch = err
+		}
+		cancel()
+	}
 	sem := make(chan struct{}, n)
 	var wg sync.WaitGroup
 	for i, it := range items {
 		select {
 		case sem <- struct{}{}:
-		case <-ctx.Done():
-			for j := i; j < len(items); j++ {
-				out[j].err = ctx.Err()
-			}
-			wg.Wait()
-			return out
+		case <-child.Done():
+		}
+		if child.Err() != nil {
+			break
 		}
 		wg.Add(1)
 		go func(i int, it fetch) {
 			defer func() { <-sem; wg.Done() }()
-			out[i].doc, out[i].err = e.Source.Fetch(ctx, it.model, it.ref)
-			if sourceWide(ctx, out[i].err) {
-				cancel()
+			doc, err := e.Source.Fetch(child, it.model, it.ref)
+			// A failure after the page was cancelled is fallout, not a cause.
+			if err != nil && child.Err() != nil {
+				return
+			}
+			out[i].doc, out[i].err = doc, err
+			if sourceWide(err) {
+				record(err)
 			}
 		}(i, it)
 	}
 	wg.Wait()
-	return out
+	if ctx.Err() != nil {
+		return out, ctx.Err()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return out, batch
 }
 
 // sourceWide reports a fetch failure that stops the whole page.
-func sourceWide(ctx context.Context, err error) bool {
-	return err != nil && (ctx.Err() != nil || errors.Is(err, ErrReset) || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrIncompatible))
+func sourceWide(err error) bool {
+	return errors.Is(err, ErrReset) || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrIncompatible)
 }
 
 // settle reports the rows that a committed page skipped. A live commit also
@@ -308,7 +351,7 @@ func (e *Engine) rebuild(ctx context.Context) error {
 	// A page with a held row is not written, but the scan continues so every
 	// row failing in this run gets its attempt. The rebuild then fails unpublished.
 	var held error
-	for _, model := range Models {
+	for _, model := range IndexedModels {
 		next := ""
 		seen := map[string]bool{}
 		for {
@@ -388,6 +431,9 @@ func (e *Engine) delta(ctx context.Context, shadow bool, c Cursor, publish bool)
 				return c, fmt.Errorf("unknown change action %q", ch.Action)
 			}
 			last = ch.SyncID
+			if !Indexed(ch.Model) {
+				continue
+			}
 			k := rowKey{ch.Model, ch.ID}
 			if _, ok := latest[k]; !ok {
 				order = append(order, k)
@@ -445,7 +491,7 @@ func (q *Query) Validate() error {
 	if q.Q == "" || utf8.RuneCountInString(q.Q) > 256 {
 		return errors.New("q must contain 1 to 256 characters")
 	}
-	if q.Model != "" && !ValidModel(q.Model) {
+	if q.Model != "" && !Indexed(q.Model) {
 		return errors.New("unknown model")
 	}
 	if q.Limit == 0 {

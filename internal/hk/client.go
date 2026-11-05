@@ -30,6 +30,22 @@ const maxRow = 16 << 20
 // next start rebuilds the index. TestExtractionPinsVersion enforces the bump.
 const ExtractVersion = 1
 
+// ExcludedDocumentPrefixes are document key prefixes kept out of the index:
+// job artifacts that copy task text (briefs, reports) and one-shot imports of
+// other systems' files (operator/). hk:doc decision/2026-11-05/hk-work-record-model.
+// The list is part of the index generation (cmd/recallbeam), so changing it
+// rebuilds the index.
+var ExcludedDocumentPrefixes = []string{"brief/", "briefs/", "report/", "reports/", "operator/"}
+
+func excludedDocument(key string) bool {
+	for _, p := range ExcludedDocumentPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
 // rowShape lists, per model, the fields Fetch reads and their JSON kind.
 // hk serves raw database rows (to_jsonb emits every column, NULLs included)
 // and API structs that always emit these keys, so a missing or retyped field
@@ -133,11 +149,17 @@ func (c Client) Bootstrap(ctx context.Context, model, cursor string) (core.Page,
 	if p.Schema < 1 || p.Max < 0 || len(p.Rows) > 1000 {
 		return p, errors.New("invalid bootstrap page")
 	}
+	kept := p.Rows[:0]
 	for _, r := range p.Rows {
 		if r.ID == "" || (model == "document" && r.Key == "") {
 			return p, errors.New("invalid bootstrap row")
 		}
+		if model == "document" && excludedDocument(r.Key) {
+			continue
+		}
+		kept = append(kept, r)
 	}
+	p.Rows = kept
 	return p, nil
 }
 func (c Client) Delta(ctx context.Context, after int64) (core.Delta, error) {
@@ -224,6 +246,10 @@ func (c Client) Fetch(ctx context.Context, model string, ref core.Ref) (core.Doc
 	}
 	if err = json.Unmarshal(body, &raw); err != nil {
 		return d, err
+	}
+	if model == "document" && excludedDocument(raw.Key) {
+		// Out of scope: a delete, so a row indexed before the change leaves.
+		return core.Doc{}, core.ErrNotFound
 	}
 	d.Key = raw.Key
 	d.Title = raw.Title

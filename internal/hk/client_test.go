@@ -349,3 +349,35 @@ func TestCloudflareAccessServiceToken(t *testing.T) {
 		t.Fatal("headers sent without a configured token")
 	}
 }
+
+// Job artifacts and imports stay out of the index: bootstrap drops their
+// rows, and a fetch of one is a delete so an earlier copy leaves the index.
+func TestExcludedDocumentPrefixes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/v1/sync/bootstrap"):
+			fmt.Fprint(w, `{"rows":[{"id":"1","key":"reports/9-x/report.md"},{"id":"2","key":"decision/2026-11-05/a"},{"id":"3","key":"briefs/2026-11-05/b"},{"id":"4","key":"operator/x"},{"id":"5","key":"linear/MGH-1"}],"cursor":"","max_sync_id":5,"schema_version":40}`)
+		case r.URL.Path == "/v1/sync/rows/document/1":
+			fmt.Fprint(w, `{"id":1,"key":"reports/9-x/report.md","kind":"note","body":"b","updated_at":"2026-11-05T00:00:00Z"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	c := Client{Base: server.URL}
+	p, err := c.Bootstrap(t.Context(), "document", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var keys []string
+	for _, r := range p.Rows {
+		keys = append(keys, r.Key)
+	}
+	if strings.Join(keys, ",") != "decision/2026-11-05/a,linear/MGH-1" {
+		t.Fatalf("bootstrap kept %v", keys)
+	}
+	if _, err := c.Fetch(t.Context(), "document", core.Ref{ID: "1"}); !errors.Is(err, core.ErrNotFound) {
+		t.Fatalf("excluded fetch = %v, want ErrNotFound", err)
+	}
+}
