@@ -156,6 +156,11 @@ type Engine struct {
 	// failures counts consecutive failed fetches per model/ID. Tick holds the
 	// writer lock, so access is serialized.
 	failures map[string]int
+	// CheckDoc, when set, rejects a fetched row the index cannot store (for
+	// example a key over its column limit). A rejection is a row-specific
+	// failure: it holds the page and is skipped after RowAttempts, so one
+	// source value cannot block ingestion the way a failed write would.
+	CheckDoc func(Doc) error
 }
 
 func (e *Engine) Tick(ctx context.Context, rebuild bool) error {
@@ -208,6 +213,11 @@ func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, []sk
 	for _, it := range items {
 		key := it.model + "/" + it.ref.ID
 		d, err := e.Source.Fetch(ctx, it.model, it.ref)
+		if err == nil && e.CheckDoc != nil {
+			c := d
+			c.Source, c.Model, c.ID = e.Name, it.model, it.ref.ID
+			err = e.CheckDoc(c)
+		}
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			if errors.Is(err, ErrIncompatible) {
 				log.Printf("sync.row_incompatible model=%s model_id=%q err=%q", it.model, it.ref.ID, err)

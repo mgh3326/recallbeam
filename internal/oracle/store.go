@@ -212,12 +212,33 @@ func binds(values ...any) []any {
 // migrations/001_index.sql. title and tags are cut at a UTF-8 boundary;
 // search_text still carries the whole title, so no text drops out of search.
 // doc_key and identifier are never cut: exact and prefix search match them,
-// so a value over its column limit fails as a row error (logged, skipped
-// after RowAttempts) instead of being stored altered.
+// so a value over its column limit is rejected by CheckDoc as a row error
+// (held, then skipped after RowAttempts) instead of being stored altered.
 const (
 	titleMax = 2048
 	tagsMax  = 2048
 )
+
+// Byte limits of the exact-match columns doc_key and identifier
+// (migrations/001_index.sql). They are never cut; CheckDoc rejects a row
+// that exceeds them before the write.
+const (
+	keyMax        = 1024
+	identifierMax = 256
+)
+
+// CheckDoc reports a document the index cannot store unaltered. The engine
+// treats the error as a row failure (held, then skipped after RowAttempts)
+// instead of letting the MERGE fail the whole page.
+func CheckDoc(d core.Doc) error {
+	if len(d.Key) > keyMax {
+		return fmt.Errorf("doc_key is %d bytes, over the %d-byte column", len(d.Key), keyMax)
+	}
+	if len(d.Identifier) > identifierMax {
+		return fmt.Errorf("identifier is %d bytes, over the %d-byte column", len(d.Identifier), identifierMax)
+	}
+	return nil
+}
 
 // clipBytes returns s cut to at most n bytes without splitting a rune.
 func clipBytes(s string, n int) string {
