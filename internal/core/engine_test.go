@@ -689,3 +689,44 @@ type ctxSource struct {
 func (s ctxSource) Fetch(ctx context.Context, _ string, r core.Ref) (core.Doc, error) {
 	return s.fetch(ctx, r)
 }
+
+// A row the index cannot store (CheckDoc) is a row failure: it holds the
+// page, then is skipped after RowAttempts so the cursor moves and the other
+// rows are indexed (review on recallbeam #10: a failed write would block
+// the page forever).
+func TestCheckDocRejectionIsSkippedAfterAttempts(t *testing.T) {
+	m := newMemory()
+	seed(m)
+	// An earlier version of the row is already indexed; once the row is
+	// rejected it must not stay searchable.
+	m.docs[m.active]["document/long"] = core.Doc{Source: "hk", Model: "document", ID: "long", SyncID: 5, Title: "old version"}
+	s := source{delta: func(a int64) (core.Delta, error) {
+		if a >= 12 {
+			return core.Delta{Metadata: core.Metadata{Last: 12, Max: 12, Schema: 1}}, nil
+		}
+		return core.Delta{Changes: []core.Change{{SyncID: 11, Model: "document", ID: "long", Action: "U"}, {SyncID: 12, Model: "task", ID: "1", Action: "U"}}, Metadata: core.Metadata{Last: 12, Max: 12, Schema: 1}}, nil
+	}}
+	e := core.Engine{Source: s, Store: m, Name: "hk", CheckDoc: func(d core.Doc) error {
+		if d.ID == "long" {
+			return errors.New("doc_key over the column limit")
+		}
+		return nil
+	}}
+	for i := 1; i < core.RowAttempts; i++ {
+		if err := e.Tick(t.Context(), false); !errors.Is(err, core.ErrRowHeld) {
+			t.Fatalf("attempt %d: %v, want ErrRowHeld", i, err)
+		}
+		if m.cursors[m.active].Last != 10 {
+			t.Fatalf("cursor moved while the row was held: %+v", m.cursors[m.active])
+		}
+	}
+	if err := e.Tick(t.Context(), false); err != nil {
+		t.Fatalf("final attempt: %v", err)
+	}
+	if m.cursors[m.active].Last != 12 || m.docs[m.active]["task/1"].SyncID != 12 {
+		t.Fatalf("page did not commit after the skip: %+v", m)
+	}
+	if d, ok := m.docs[m.active]["document/long"]; ok {
+		t.Fatalf("rejected row is still indexed: %+v", d)
+	}
+}

@@ -117,7 +117,7 @@ func (s *Store) Apply(ctx context.Context, shadow bool, ms []core.Mutation, c co
 		} else {
 			_, err = tx.ExecContext(ctx, `MERGE INTO rb_docs_`+slot+` d USING (SELECT :p1 source,:p2 model,:p3 model_id FROM dual) x ON (d.source=x.source AND d.model=x.model AND d.model_id=x.model_id)
 WHEN MATCHED THEN UPDATE SET d.doc_key=:p4,d.identifier=:p11,d.title=:p5,d.body=:p6,d.tags=:p7,d.updated_at=:p8,d.source_sync_id=:p9,d.search_text=:p10
-WHEN NOT MATCHED THEN INSERT(source,model,model_id,doc_key,title,body,tags,updated_at,source_sync_id,search_text,identifier) VALUES(x.source,x.model,x.model_id,:p4,:p5,:p6,:p7,:p8,:p9,:p10,:p11)`, binds(d.Source, d.Model, d.ID, clipBytes(d.Key, keyMax), clipBytes(d.Title, titleMax), goora.Clob{String: d.Body, Valid: true}, clipBytes(d.Tags, tagsMax), d.UpdatedAt, d.SyncID, goora.Clob{String: d.Title + "\n" + d.Body, Valid: true}, clipBytes(d.Identifier, identifierMax))...)
+WHEN NOT MATCHED THEN INSERT(source,model,model_id,doc_key,title,body,tags,updated_at,source_sync_id,search_text,identifier) VALUES(x.source,x.model,x.model_id,:p4,:p5,:p6,:p7,:p8,:p9,:p10,:p11)`, binds(d.Source, d.Model, d.ID, d.Key, clipBytes(d.Title, titleMax), goora.Clob{String: d.Body, Valid: true}, clipBytes(d.Tags, tagsMax), d.UpdatedAt, d.SyncID, goora.Clob{String: d.Title + "\n" + d.Body, Valid: true}, d.Identifier)...)
 		}
 		if err != nil {
 			return err
@@ -208,15 +208,37 @@ func binds(values ...any) []any {
 	return out
 }
 
-// Byte limits of the VARCHAR2 columns in migrations/001_index.sql. A longer
-// value is cut at a UTF-8 boundary for display and exact match; search_text
-// still carries the whole title, so no text drops out of search.
+// Byte limits of the display-only VARCHAR2 columns in
+// migrations/001_index.sql. title and tags are cut at a UTF-8 boundary;
+// search_text still carries the whole title, so no text drops out of search.
+// doc_key and identifier are never cut: exact and prefix search match them,
+// so a value over its column limit is rejected by CheckDoc as a row error
+// (held, then skipped after RowAttempts) instead of being stored altered.
+const (
+	titleMax = 2048
+	tagsMax  = 2048
+)
+
+// Byte limits of the exact-match columns doc_key and identifier
+// (migrations/001_index.sql). They are never cut; CheckDoc rejects a row
+// that exceeds them before the write.
 const (
 	keyMax        = 1024
-	titleMax      = 2048
-	tagsMax       = 2048
 	identifierMax = 256
 )
+
+// CheckDoc reports a document the index cannot store unaltered. The engine
+// treats the error as a row failure (held, then skipped after RowAttempts)
+// instead of letting the MERGE fail the whole page.
+func CheckDoc(d core.Doc) error {
+	if len(d.Key) > keyMax {
+		return fmt.Errorf("doc_key is %d bytes, over the %d-byte column", len(d.Key), keyMax)
+	}
+	if len(d.Identifier) > identifierMax {
+		return fmt.Errorf("identifier is %d bytes, over the %d-byte column", len(d.Identifier), identifierMax)
+	}
+	return nil
+}
 
 // clipBytes returns s cut to at most n bytes without splitting a rune.
 func clipBytes(s string, n int) string {

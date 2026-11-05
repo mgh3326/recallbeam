@@ -153,3 +153,16 @@ func TestClipBytesKeepsRunesWhole(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckDocLimits(t *testing.T) {
+	ok := core.Doc{Key: strings.Repeat("k", keyMax), Identifier: strings.Repeat("i", identifierMax)}
+	if err := CheckDoc(ok); err != nil {
+		t.Fatalf("at the limit: %v", err)
+	}
+	if CheckDoc(core.Doc{Key: strings.Repeat("k", keyMax+1)}) == nil {
+		t.Fatal("over-limit key accepted")
+	}
+	if CheckDoc(core.Doc{Identifier: strings.Repeat("검", 86)}) == nil { // 258 bytes
+		t.Fatal("over-limit identifier accepted")
+	}
+}

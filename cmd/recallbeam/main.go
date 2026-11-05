@@ -96,7 +96,7 @@ func run() error {
 		}
 		concurrency = n
 	}
-	engine := &core.Engine{Store: st, Source: source, Name: "hk", Generation: generation(), FetchConcurrency: concurrency}
+	engine := &core.Engine{Store: st, Source: source, Name: "hk", Generation: generation(), FetchConcurrency: concurrency, CheckDoc: oracle.CheckDoc}
 	if mode == "rebuild" {
 		// Attempt counts live in this process, so retry here: a row that keeps
 		// failing is skipped on the last attempt instead of failing every run.
