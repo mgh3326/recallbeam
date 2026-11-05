@@ -160,3 +160,54 @@ func TestHTTPRejectsMalformedQueryEncoding(t *testing.T) {
 		t.Fatal(w.Code, s.calls, w.Body.String())
 	}
 }
+
+// tools/list advertises exactly the models a call accepts (core.IndexedModels).
+func TestMCPModelEnumMatchesIndexedModels(t *testing.T) {
+	input := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"q":"x","model":"task_comment"}}}
+`
+	s := &search{}
+	var out bytes.Buffer
+	if err := MCP(t.Context(), strings.NewReader(input), &out, s); err != nil {
+		t.Fatal(err)
+	}
+	dec := json.NewDecoder(&out)
+	var list, call map[string]any
+	for dec.More() {
+		var r map[string]any
+		if err := dec.Decode(&r); err != nil {
+			t.Fatal(err)
+		}
+		switch r["id"] {
+		case float64(2):
+			list = r
+		case float64(3):
+			call = r
+		}
+	}
+	var got struct {
+		Result struct {
+			Tools []struct {
+				InputSchema struct {
+					Properties struct {
+						Model struct {
+							Enum []string `json:"enum"`
+						} `json:"model"`
+					} `json:"properties"`
+				} `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	b, _ := json.Marshal(list)
+	if err := json.Unmarshal(b, &got); err != nil || len(got.Result.Tools) != 1 {
+		t.Fatalf("tools/list: %s", b)
+	}
+	if enum := got.Result.Tools[0].InputSchema.Properties.Model.Enum; strings.Join(enum, ",") != strings.Join(core.IndexedModels, ",") {
+		t.Fatalf("enum %v, want %v", enum, core.IndexedModels)
+	}
+	cb, _ := json.Marshal(call)
+	if s.calls != 0 || !bytes.Contains(cb, []byte(`"isError":true`)) && call["error"] == nil {
+		t.Fatalf("a model outside the enum was searched: %s", cb)
+	}
+}

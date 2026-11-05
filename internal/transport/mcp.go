@@ -98,7 +98,7 @@ func MCP(ctx context.Context, in io.Reader, out io.Writer, s core.Searcher) erro
 			case "ping":
 				result = map[string]any{}
 			case "tools/list":
-				result = map[string]any{"tools": []any{map[string]any{"name": "search", "description": "Search indexed source documents, tasks, comments and decisions.", "annotations": map[string]bool{"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}, "inputSchema": map[string]any{"type": "object", "required": []string{"q"}, "additionalProperties": false, "properties": map[string]any{"q": map[string]any{"type": "string", "minLength": 1, "maxLength": 256}, "model": map[string]any{"type": "string", "enum": core.Models}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 100}}}}}}
+				result = map[string]any{"tools": []any{map[string]any{"name": "search", "description": "Search indexed source documents, tasks and decisions.", "annotations": map[string]bool{"readOnlyHint": true, "destructiveHint": false, "openWorldHint": false}, "inputSchema": map[string]any{"type": "object", "required": []string{"q"}, "additionalProperties": false, "properties": map[string]any{"q": map[string]any{"type": "string", "minLength": 1, "maxLength": 256}, "model": map[string]any{"type": "string", "enum": core.IndexedModels}, "limit": map[string]any{"type": "integer", "minimum": 1, "maximum": 100}}}}}}
 			case "tools/call":
 				var p struct {
 					Name      string          `json:"name"`
@@ -160,7 +160,7 @@ func searchArguments(raw json.RawMessage) (core.Query, error) {
 			err = json.Unmarshal(value, &q.Q)
 		case "model":
 			err = json.Unmarshal(value, &q.Model)
-			if err == nil && !core.ValidModel(q.Model) {
+			if err == nil && !core.Indexed(q.Model) {
 				err = errors.New("unknown model")
 			}
 		case "limit":
