@@ -14,6 +14,23 @@ import (
 )
 
 var Models = []string{"document", "task", "task_comment", "decision"}
+
+// IndexedModels are the Models the index holds. A change to a model outside
+// it moves the cursor and is otherwise ignored. Task comments are left out
+// (hk:doc decision/2026-11-05/hk-work-record-model: mostly machine notes).
+// The list is part of Generation, so changing it rebuilds the index.
+var IndexedModels = []string{"document", "task", "decision"}
+
+// Indexed reports whether model m is in IndexedModels.
+func Indexed(m string) bool {
+	for _, v := range IndexedModels {
+		if m == v {
+			return true
+		}
+	}
+	return false
+}
+
 var ErrReset = errors.New("source requires bootstrap")
 var ErrNotFound = errors.New("source row missing")
 
@@ -100,7 +117,7 @@ type Cursor struct {
 // version is deliberately not an input; row shape is checked on each fetch.
 func Generation(parts ...string) int64 {
 	h := sha256.New()
-	for _, m := range Models {
+	for _, m := range IndexedModels {
 		fmt.Fprintf(h, "model %q\n", m)
 	}
 	for _, p := range parts {
@@ -246,7 +263,7 @@ func (e *Engine) rebuild(ctx context.Context) error {
 	// A page with a held row is not written, but the scan continues so every
 	// row failing in this run gets its attempt. The rebuild then fails unpublished.
 	var held error
-	for _, model := range Models {
+	for _, model := range IndexedModels {
 		next := ""
 		seen := map[string]bool{}
 		for {
@@ -326,6 +343,9 @@ func (e *Engine) delta(ctx context.Context, shadow bool, c Cursor, publish bool)
 				return c, fmt.Errorf("unknown change action %q", ch.Action)
 			}
 			last = ch.SyncID
+			if !Indexed(ch.Model) {
+				continue
+			}
 			k := rowKey{ch.Model, ch.ID}
 			if _, ok := latest[k]; !ok {
 				order = append(order, k)
@@ -383,7 +403,7 @@ func (q *Query) Validate() error {
 	if q.Q == "" || utf8.RuneCountInString(q.Q) > 256 {
 		return errors.New("q must contain 1 to 256 characters")
 	}
-	if q.Model != "" && !ValidModel(q.Model) {
+	if q.Model != "" && !Indexed(q.Model) {
 		return errors.New("unknown model")
 	}
 	if q.Limit == 0 {
