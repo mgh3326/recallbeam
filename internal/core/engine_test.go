@@ -556,6 +556,9 @@ func TestNonIndexedModelAdvancesCursor(t *testing.T) {
 func TestCheckDocRejectionIsSkippedAfterAttempts(t *testing.T) {
 	m := newMemory()
 	seed(m)
+	// An earlier version of the row is already indexed; once the row is
+	// rejected it must not stay searchable.
+	m.docs[m.active]["document/long"] = core.Doc{Source: "hk", Model: "document", ID: "long", SyncID: 5, Title: "old version"}
 	s := source{delta: func(a int64) (core.Delta, error) {
 		if a >= 12 {
 			return core.Delta{Metadata: core.Metadata{Last: 12, Max: 12, Schema: 1}}, nil
@@ -582,7 +585,7 @@ func TestCheckDocRejectionIsSkippedAfterAttempts(t *testing.T) {
 	if m.cursors[m.active].Last != 12 || m.docs[m.active]["task/1"].SyncID != 12 {
 		t.Fatalf("page did not commit after the skip: %+v", m)
 	}
-	if _, ok := m.docs[m.active]["document/long"]; ok {
-		t.Fatal("rejected row was indexed")
+	if d, ok := m.docs[m.active]["document/long"]; ok {
+		t.Fatalf("rejected row is still indexed: %+v", d)
 	}
 }

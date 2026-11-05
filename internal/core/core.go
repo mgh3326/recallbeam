@@ -205,7 +205,8 @@ type skip struct {
 // delete. A row-specific failure holds the batch until it has failed
 // RowAttempts times, after which the row is skipped; every other row is still
 // fetched so their attempts are counted in the same poll. A held batch returns
-// ErrRowHeld and no mutations.
+// ErrRowHeld and no mutations. A row skipped because CheckDoc rejects it is
+// also deleted from the index.
 func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, []skip, error) {
 	out := make([]Mutation, 0, len(items))
 	var skips []skip
@@ -213,10 +214,12 @@ func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, []sk
 	for _, it := range items {
 		key := it.model + "/" + it.ref.ID
 		d, err := e.Source.Fetch(ctx, it.model, it.ref)
+		rejected := false
 		if err == nil && e.CheckDoc != nil {
 			c := d
 			c.Source, c.Model, c.ID = e.Name, it.model, it.ref.ID
 			err = e.CheckDoc(c)
+			rejected = err != nil
 		}
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			if errors.Is(err, ErrIncompatible) {
@@ -231,6 +234,13 @@ func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, []sk
 			e.failures[key]++
 			if n := e.failures[key]; n >= RowAttempts {
 				skips = append(skips, skip{key: key, model: it.model, id: it.ref.ID, attempts: n, err: err})
+				// The source row now holds a value the index cannot store, so
+				// an earlier version must not stay searchable under the old
+				// key (review on recallbeam #10). A fetch failure is not a
+				// verdict on the row and keeps the old version.
+				if rejected {
+					out = append(out, Mutation{Doc: Doc{Source: e.Name, Model: it.model, ID: it.ref.ID, SyncID: it.syncID}, Delete: true})
+				}
 			} else if held == nil {
 				held = fmt.Errorf("%w: %w", ErrRowHeld, err)
 			}
