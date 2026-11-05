@@ -317,3 +317,35 @@ func TestIncompatibleRowShapeFailsLoud(t *testing.T) {
 		}
 	}
 }
+
+// An hk URL behind Cloudflare Access gets the service token on every request.
+// Without it Access redirects to its login page, which is source-wide: it must
+// hold the cursor, never count against one row.
+func TestCloudflareAccessServiceToken(t *testing.T) {
+	var gotID, gotSecret atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotID.Store(r.Header.Get("CF-Access-Client-Id"))
+		gotSecret.Store(r.Header.Get("CF-Access-Client-Secret"))
+		if r.Header.Get("CF-Access-Client-Id") == "" {
+			http.Redirect(w, r, "https://team.cloudflareaccess.com/cdn-cgi/access/login/hk", http.StatusFound)
+			return
+		}
+		fmt.Fprintln(w, `{"_metadata_":{"last_sync_id":0,"max_sync_id":0,"schema_version":1}}`)
+	}))
+	defer server.Close()
+	c := Client{Base: server.URL, Token: "t", AccessID: "id.access", AccessSecret: "access-secret"}
+	if _, err := c.Delta(t.Context(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if gotID.Load() != "id.access" || gotSecret.Load() != "access-secret" {
+		t.Fatalf("headers id=%v secret=%v", gotID.Load(), gotSecret.Load())
+	}
+	c.AccessID, c.AccessSecret = "", ""
+	_, err := c.Fetch(t.Context(), "document", core.Ref{ID: "1"})
+	if !errors.Is(err, core.ErrUnavailable) {
+		t.Fatalf("login redirect must be source-wide: %v", err)
+	}
+	if gotID.Load() != "" {
+		t.Fatal("headers sent without a configured token")
+	}
+}
