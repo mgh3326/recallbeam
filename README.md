@@ -66,7 +66,7 @@ application's policy. When configured, the service token is sent as
 
 `GET /v1/search?q=&model=&limit=` requires `Authorization: Bearer` with
 `RB_SEARCH_TOKEN`. `q` is 1–256 characters; `model` optionally selects
-`document`, `task`, `task_comment`, or `decision`; `limit` defaults to 20 and
+`document`, `task`, or `decision`; `limit` defaults to 20 and
 must be 1–100. The response has a `results` array containing source, model,
 model ID, key, identifier, title, body, tags, update time, source sync ID,
 ranking tier, and text score. Results use stable source/model/ID tie-breaks.
@@ -88,6 +88,17 @@ same `q`, `model`, and `limit` arguments. Configure the executable and database
 environment in the MCP client. Stdio is a local process boundary; HTTP uses the
 search bearer token. Run `serve` separately to maintain ingestion. Protocol
 versions 2024-11-05, 2025-03-26, and 2025-06-18 are supported.
+
+## Index scope
+
+The index holds hk documents, tasks and decisions. Task comments are left out
+(mostly machine notes); their change events only move the cursor. Documents
+whose key starts with `brief/`, `briefs/`, `report/`, `reports/` or
+`operator/` are left out too: job artifacts that copy task text, and a one-shot
+import of another system's files. A fetch of such a document counts as a
+delete, so an earlier copy leaves the index. Both lists are part of the index
+generation, so changing either rebuilds. Decision: hk:doc
+`decision/2026-11-05/hk-work-record-model`.
 
 ## Ingestion and rebuild
 
