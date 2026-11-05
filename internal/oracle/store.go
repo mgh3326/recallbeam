@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mgh3326/recallbeam/internal/core"
 	goora "github.com/sijms/go-ora/v2"
@@ -116,7 +117,7 @@ func (s *Store) Apply(ctx context.Context, shadow bool, ms []core.Mutation, c co
 		} else {
 			_, err = tx.ExecContext(ctx, `MERGE INTO rb_docs_`+slot+` d USING (SELECT :p1 source,:p2 model,:p3 model_id FROM dual) x ON (d.source=x.source AND d.model=x.model AND d.model_id=x.model_id)
 WHEN MATCHED THEN UPDATE SET d.doc_key=:p4,d.identifier=:p11,d.title=:p5,d.body=:p6,d.tags=:p7,d.updated_at=:p8,d.source_sync_id=:p9,d.search_text=:p10
-WHEN NOT MATCHED THEN INSERT(source,model,model_id,doc_key,title,body,tags,updated_at,source_sync_id,search_text,identifier) VALUES(x.source,x.model,x.model_id,:p4,:p5,:p6,:p7,:p8,:p9,:p10,:p11)`, binds(d.Source, d.Model, d.ID, d.Key, d.Title, goora.Clob{String: d.Body, Valid: true}, d.Tags, d.UpdatedAt, d.SyncID, goora.Clob{String: d.Title + "\n" + d.Body, Valid: true}, d.Identifier)...)
+WHEN NOT MATCHED THEN INSERT(source,model,model_id,doc_key,title,body,tags,updated_at,source_sync_id,search_text,identifier) VALUES(x.source,x.model,x.model_id,:p4,:p5,:p6,:p7,:p8,:p9,:p10,:p11)`, binds(d.Source, d.Model, d.ID, clipBytes(d.Key, keyMax), clipBytes(d.Title, titleMax), goora.Clob{String: d.Body, Valid: true}, clipBytes(d.Tags, tagsMax), d.UpdatedAt, d.SyncID, goora.Clob{String: d.Title + "\n" + d.Body, Valid: true}, clipBytes(d.Identifier, identifierMax))...)
 		}
 		if err != nil {
 			return err
@@ -205,4 +206,25 @@ func binds(values ...any) []any {
 		out[i] = sql.Named(fmt.Sprintf("p%d", i+1), v)
 	}
 	return out
+}
+
+// Byte limits of the VARCHAR2 columns in migrations/001_index.sql. A longer
+// value is cut at a UTF-8 boundary for display and exact match; search_text
+// still carries the whole title, so no text drops out of search.
+const (
+	keyMax        = 1024
+	titleMax      = 2048
+	tagsMax       = 2048
+	identifierMax = 256
+)
+
+// clipBytes returns s cut to at most n bytes without splitting a rune.
+func clipBytes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
