@@ -133,3 +133,23 @@ func (lobConverter) ConvertValue(v any) (driver.Value, error) {
 	}
 	return driver.DefaultParameterConverter.ConvertValue(v)
 }
+
+// A source title longer than the column (a 3,960-byte hk task title failed
+// the first full rebuild with ORA-12899) is cut at a rune boundary; the
+// full title still reaches search_text.
+func TestClipBytesKeepsRunesWhole(t *testing.T) {
+	long := strings.Repeat("검", 1000) // 3000 bytes
+	got := clipBytes(long, titleMax)
+	if len(got) > titleMax || !strings.HasPrefix(long, got) || len(got) != 2046 {
+		t.Fatalf("clip: len=%d prefix=%v", len(got), strings.HasPrefix(long, got))
+	}
+	for _, tc := range []struct {
+		in   string
+		n    int
+		want string
+	}{{"abc", 5, "abc"}, {"abc", 2, "ab"}, {"a검", 2, "a"}, {"a검", 4, "a검"}, {"", 3, ""}} {
+		if got := clipBytes(tc.in, tc.n); got != tc.want {
+			t.Errorf("clipBytes(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
+		}
+	}
+}
