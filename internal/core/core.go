@@ -9,6 +9,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -139,6 +140,10 @@ type Engine struct {
 	// failures counts consecutive failed fetches per model/ID. Tick holds the
 	// writer lock, so access is serialized.
 	failures map[string]int
+	// FetchConcurrency bounds the row fetches of one page that run at once;
+	// 0 or 1 fetches one at a time. Source must then be safe for concurrent
+	// use. Results are still applied in page order.
+	FetchConcurrency int
 }
 
 func (e *Engine) Tick(ctx context.Context, rebuild bool) error {
@@ -185,12 +190,13 @@ type skip struct {
 // fetched so their attempts are counted in the same poll. A held batch returns
 // ErrRowHeld and no mutations.
 func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, []skip, error) {
+	results := e.fetchAll(ctx, items)
 	out := make([]Mutation, 0, len(items))
 	var skips []skip
 	var held error
-	for _, it := range items {
+	for i, it := range items {
 		key := it.model + "/" + it.ref.ID
-		d, err := e.Source.Fetch(ctx, it.model, it.ref)
+		d, err := results[i].doc, results[i].err
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			if errors.Is(err, ErrIncompatible) {
 				log.Printf("sync.row_incompatible model=%s model_id=%q err=%q", it.model, it.ref.ID, err)
@@ -224,6 +230,62 @@ func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, []sk
 		return nil, nil, held
 	}
 	return out, skips, nil
+}
+
+type fetched struct {
+	doc Doc
+	err error
+}
+
+// fetchAll fetches every item, at most FetchConcurrency at once, and returns
+// the results in item order. A source-wide failure cancels the fetches not
+// yet started; mutations then returns that failure, as it did when fetching
+// one at a time.
+func (e *Engine) fetchAll(ctx context.Context, items []fetch) []fetched {
+	out := make([]fetched, len(items))
+	n := e.FetchConcurrency
+	if n <= 1 {
+		for i, it := range items {
+			out[i].doc, out[i].err = e.Source.Fetch(ctx, it.model, it.ref)
+			if sourceWide(ctx, out[i].err) {
+				for j := i + 1; j < len(items); j++ {
+					out[j].err = out[i].err
+				}
+				break
+			}
+		}
+		return out
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sem := make(chan struct{}, n)
+	var wg sync.WaitGroup
+	for i, it := range items {
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			for j := i; j < len(items); j++ {
+				out[j].err = ctx.Err()
+			}
+			wg.Wait()
+			return out
+		}
+		wg.Add(1)
+		go func(i int, it fetch) {
+			defer func() { <-sem; wg.Done() }()
+			out[i].doc, out[i].err = e.Source.Fetch(ctx, it.model, it.ref)
+			if sourceWide(ctx, out[i].err) {
+				cancel()
+			}
+		}(i, it)
+	}
+	wg.Wait()
+	return out
+}
+
+// sourceWide reports a fetch failure that stops the whole page.
+func sourceWide(ctx context.Context, err error) bool {
+	return err != nil && (ctx.Err() != nil || errors.Is(err, ErrReset) || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrIncompatible))
 }
 
 // settle reports the rows that a committed page skipped. A live commit also

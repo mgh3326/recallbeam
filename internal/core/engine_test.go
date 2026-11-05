@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/recallbeam/internal/core"
 )
@@ -522,5 +525,62 @@ func TestSkipIsLoggedOnlyWhenItsPageCommits(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), `model_id="bad"`) {
 		t.Fatalf("committed skip not logged: %q", logs.String())
+	}
+}
+
+// FetchConcurrency fetches one page's rows at most N at a time and applies
+// them in page order; a source-wide failure still fails the whole page.
+func TestConcurrentFetchBoundedAndOrdered(t *testing.T) {
+	const n, rows = 4, 40
+	var inFlight, peak atomic.Int32
+	var changes []core.Change
+	for i := range rows {
+		changes = append(changes, core.Change{SyncID: int64(11 + i), Model: "task", ID: strconv.Itoa(i), Action: "U"})
+	}
+	last := int64(10 + rows)
+	fetch := func(_ string, r core.Ref) (core.Doc, error) {
+		v := inFlight.Add(1)
+		for p := peak.Load(); v > p && !peak.CompareAndSwap(p, v); p = peak.Load() {
+		}
+		time.Sleep(2 * time.Millisecond)
+		inFlight.Add(-1)
+		return core.Doc{Body: "row " + r.ID}, nil
+	}
+	m := newMemory()
+	seed(m)
+	s := source{fetch: fetch, delta: func(a int64) (core.Delta, error) {
+		if a >= last {
+			return core.Delta{Metadata: core.Metadata{Last: last, Max: last, Schema: 1}}, nil
+		}
+		return core.Delta{Changes: changes, Metadata: core.Metadata{Last: last, Max: last, Schema: 1}}, nil
+	}}
+	e := core.Engine{Source: s, Store: m, Name: "hk", FetchConcurrency: n}
+	if err := e.Tick(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+	if p := peak.Load(); p < 2 || p > n {
+		t.Fatalf("peak in-flight fetches = %d, want 2..%d", p, n)
+	}
+	for i := range rows {
+		if d := m.docs[m.active]["task/"+strconv.Itoa(i)]; d.Body != "row "+strconv.Itoa(i) || d.SyncID != int64(11+i) {
+			t.Fatalf("row %d: %+v", i, d)
+		}
+	}
+
+	// A source-wide failure on one row fails the page and moves no cursor.
+	m2 := newMemory()
+	seed(m2)
+	s.fetch = func(_ string, r core.Ref) (core.Doc, error) {
+		if r.ID == "7" {
+			return core.Doc{}, core.ErrUnavailable
+		}
+		return core.Doc{Body: "x"}, nil
+	}
+	e2 := core.Engine{Source: s, Store: m2, Name: "hk", FetchConcurrency: n}
+	if err := e2.Tick(t.Context(), false); !errors.Is(err, core.ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if m2.cursors[m2.active].Last != 10 {
+		t.Fatalf("cursor moved on a failed page: %+v", m2.cursors[m2.active])
 	}
 }
