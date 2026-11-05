@@ -63,3 +63,20 @@ func TestGenerationIsStableAndCoversMigrations(t *testing.T) {
 		t.Fatal("migration digest must be stable")
 	}
 }
+
+func TestHKSourceAccessTokenComesInPairs(t *testing.T) {
+	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+	if _, err := hkSource(env(map[string]string{"RB_HK_CF_ACCESS_CLIENT_ID": "id"})); err == nil {
+		t.Fatal("id without secret accepted")
+	}
+	if _, err := hkSource(env(map[string]string{"RB_HK_CF_ACCESS_CLIENT_SECRET": " s "})); err == nil {
+		t.Fatal("secret without id accepted")
+	}
+	c, err := hkSource(env(map[string]string{"RB_HK_URL": "https://hk.example", "RB_HK_TOKEN": "t", "RB_HK_CF_ACCESS_CLIENT_ID": " id ", "RB_HK_CF_ACCESS_CLIENT_SECRET": "s"}))
+	if err != nil || c.AccessID != "id" || c.AccessSecret != "s" || c.Base != "https://hk.example" {
+		t.Fatalf("pair: %+v %v", c, err)
+	}
+	if c, err = hkSource(env(map[string]string{"RB_HK_CF_ACCESS_CLIENT_ID": "  ", "RB_HK_CF_ACCESS_CLIENT_SECRET": ""})); err != nil || c.AccessID != "" {
+		t.Fatalf("blank pair is unset: %+v %v", c, err)
+	}
+}

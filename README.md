@@ -37,6 +37,7 @@ connection details, or wallets into source control. `wallet/` is ignored.
 | `RB_WALLET_DIR` | Wallet directory containing the auto-login wallet, required |
 | `RB_HK_URL` | Source base URL; HTTPS required except HTTP to literal loopback IPs; required for serve and rebuild |
 | `RB_HK_TOKEN` | Source bearer token with read scope; required for serve and rebuild |
+| `RB_HK_CF_ACCESS_CLIENT_ID`, `RB_HK_CF_ACCESS_CLIENT_SECRET` | Cloudflare Access service token for an `RB_HK_URL` behind Access; set both or neither |
 | `RB_SEARCH_TOKEN` | Search bearer token; required for serve |
 | `RB_LISTEN_ADDR` | HTTP bind address, default IPv4 loopback on port 8080; non-loopback overrides require a protected proxy network |
 | `RB_SYNC_INTERVAL` | Poll interval as a Go duration; default 15s, range 1s–1h |
@@ -58,6 +59,10 @@ Source requests require HTTPS before a bearer token is attached. Plain HTTP
 is permitted only for literal loopback IPs, allowing local tests and tunnels;
 remote HTTP URLs, DNS hostnames over HTTP, and URL userinfo are rejected.
 Redirects are not followed, including with an injected HTTP client.
+A redirect is a source-wide failure that holds the cursor; behind Cloudflare
+Access it usually means the service token is missing or not allowed by the
+application's policy. When configured, the service token is sent as
+`CF-Access-Client-Id`/`CF-Access-Client-Secret` on every source request.
 
 `GET /v1/search?q=&model=&limit=` requires `Authorization: Bearer` with
 `RB_SEARCH_TOKEN`. `q` is 1–256 characters; `model` optionally selects

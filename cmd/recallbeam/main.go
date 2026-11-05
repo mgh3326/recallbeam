@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -83,7 +84,11 @@ func run() error {
 	if err = required("RB_HK_URL", "RB_HK_TOKEN"); err != nil {
 		return err
 	}
-	engine := &core.Engine{Store: st, Source: hk.Client{Base: os.Getenv("RB_HK_URL"), Token: os.Getenv("RB_HK_TOKEN")}, Name: "hk", Generation: generation()}
+	source, err := hkSource(os.Getenv)
+	if err != nil {
+		return err
+	}
+	engine := &core.Engine{Store: st, Source: source, Name: "hk", Generation: generation()}
 	if mode == "rebuild" {
 		// Attempt counts live in this process, so retry here: a row that keeps
 		// failing is skipped on the last attempt instead of failing every run.
@@ -95,7 +100,7 @@ func run() error {
 			}
 		}
 		if err != nil {
-			return errors.New("rebuild failed; publication outcome may be unknown; rerun rebuild")
+			return fmt.Errorf("rebuild failed; publication outcome may be unknown; rerun rebuild: %w", err)
 		}
 		return nil
 	}
@@ -182,4 +187,15 @@ func listenAddress() string {
 		return addr
 	}
 	return "127.0.0.1:8080"
+}
+
+// hkSource builds the hk client from the environment. A Cloudflare Access
+// service token is optional, but its id and secret come together.
+func hkSource(getenv func(string) string) (hk.Client, error) {
+	id := strings.TrimSpace(getenv("RB_HK_CF_ACCESS_CLIENT_ID"))
+	secret := strings.TrimSpace(getenv("RB_HK_CF_ACCESS_CLIENT_SECRET"))
+	if (id == "") != (secret == "") {
+		return hk.Client{}, errors.New("RB_HK_CF_ACCESS_CLIENT_ID and RB_HK_CF_ACCESS_CLIENT_SECRET must be set together")
+	}
+	return hk.Client{Base: getenv("RB_HK_URL"), Token: getenv("RB_HK_TOKEN"), AccessID: id, AccessSecret: secret}, nil
 }

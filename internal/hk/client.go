@@ -59,7 +59,10 @@ func checkShape(model string, body []byte) error {
 
 type Client struct {
 	Base, Token string
-	HTTP        *http.Client
+	// AccessID and AccessSecret are a Cloudflare Access service token for an
+	// hk URL behind Access. Both or neither are set (see cmd/recallbeam).
+	AccessID, AccessSecret string
+	HTTP                   *http.Client
 }
 
 func (c Client) get(ctx context.Context, path string) (*http.Response, error) {
@@ -74,6 +77,10 @@ func (c Client) get(ctx context.Context, path string) (*http.Response, error) {
 		return nil, errors.New("hk source URL requires HTTPS; HTTP is allowed only for literal loopback IPs")
 	}
 	req.Header.Set("Authorization", "Bearer "+c.Token)
+	if c.AccessID != "" {
+		req.Header.Set("CF-Access-Client-Id", c.AccessID)
+		req.Header.Set("CF-Access-Client-Secret", c.AccessSecret)
+	}
 	client := http.Client{Timeout: 60 * time.Second}
 	if c.HTTP != nil {
 		client = *c.HTTP
@@ -86,6 +93,12 @@ func (c Client) get(ctx context.Context, path string) (*http.Response, error) {
 	}
 	if r.StatusCode != http.StatusOK {
 		defer r.Body.Close()
+		// Redirects are never followed. Cloudflare Access answers a missing or
+		// refused service token with a redirect to its login page, which says
+		// nothing about any one row: it is source-wide and holds the cursor.
+		if r.StatusCode >= 300 && r.StatusCode < 400 {
+			return nil, fmt.Errorf("hk redirected (status %d; Cloudflare Access login when the service token is missing or not allowed): %w", r.StatusCode, core.ErrUnavailable)
+		}
 		switch r.StatusCode {
 		case http.StatusGone:
 			return nil, core.ErrReset
