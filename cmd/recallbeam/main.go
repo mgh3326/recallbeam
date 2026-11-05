@@ -88,7 +88,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	engine := &core.Engine{Store: st, Source: source, Name: "hk", Generation: generation()}
+	engine := &core.Engine{Store: st, Source: source, Name: "hk", Generation: generation(), CheckDoc: oracle.CheckDoc}
 	if mode == "rebuild" {
 		// Attempt counts live in this process, so retry here: a row that keeps
 		// failing is skipped on the last attempt instead of failing every run.
