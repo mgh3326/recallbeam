@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mgh3326/recallbeam/internal/core"
 )
@@ -525,6 +528,63 @@ func TestSkipIsLoggedOnlyWhenItsPageCommits(t *testing.T) {
 	}
 }
 
+// FetchConcurrency fetches one page's rows at most N at a time and applies
+// them in page order; a source-wide failure still fails the whole page.
+func TestConcurrentFetchBoundedAndOrdered(t *testing.T) {
+	const n, rows = 4, 40
+	var inFlight, peak atomic.Int32
+	var changes []core.Change
+	for i := range rows {
+		changes = append(changes, core.Change{SyncID: int64(11 + i), Model: "task", ID: strconv.Itoa(i), Action: "U"})
+	}
+	last := int64(10 + rows)
+	fetch := func(_ string, r core.Ref) (core.Doc, error) {
+		v := inFlight.Add(1)
+		for p := peak.Load(); v > p && !peak.CompareAndSwap(p, v); p = peak.Load() {
+		}
+		time.Sleep(2 * time.Millisecond)
+		inFlight.Add(-1)
+		return core.Doc{Body: "row " + r.ID}, nil
+	}
+	m := newMemory()
+	seed(m)
+	s := source{fetch: fetch, delta: func(a int64) (core.Delta, error) {
+		if a >= last {
+			return core.Delta{Metadata: core.Metadata{Last: last, Max: last, Schema: 1}}, nil
+		}
+		return core.Delta{Changes: changes, Metadata: core.Metadata{Last: last, Max: last, Schema: 1}}, nil
+	}}
+	e := core.Engine{Source: s, Store: m, Name: "hk", FetchConcurrency: n}
+	if err := e.Tick(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+	if p := peak.Load(); p < 2 || p > n {
+		t.Fatalf("peak in-flight fetches = %d, want 2..%d", p, n)
+	}
+	for i := range rows {
+		if d := m.docs[m.active]["task/"+strconv.Itoa(i)]; d.Body != "row "+strconv.Itoa(i) || d.SyncID != int64(11+i) {
+			t.Fatalf("row %d: %+v", i, d)
+		}
+	}
+
+	// A source-wide failure on one row fails the page and moves no cursor.
+	m2 := newMemory()
+	seed(m2)
+	s.fetch = func(_ string, r core.Ref) (core.Doc, error) {
+		if r.ID == "7" {
+			return core.Doc{}, core.ErrUnavailable
+		}
+		return core.Doc{Body: "x"}, nil
+	}
+	e2 := core.Engine{Source: s, Store: m2, Name: "hk", FetchConcurrency: n}
+	if err := e2.Tick(t.Context(), false); !errors.Is(err, core.ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	if m2.cursors[m2.active].Last != 10 {
+		t.Fatalf("cursor moved on a failed page: %+v", m2.cursors[m2.active])
+	}
+}
+
 // A change to a model outside IndexedModels moves the cursor and fetches
 // nothing.
 func TestNonIndexedModelAdvancesCursor(t *testing.T) {
@@ -547,6 +607,87 @@ func TestNonIndexedModelAdvancesCursor(t *testing.T) {
 	if _, ok := m.docs[m.active]["task_comment/5"]; ok {
 		t.Fatal("task_comment indexed")
 	}
+}
+
+// Review on #6: fetches cut short by a page's source-wide failure are not
+// row failures (no attempts spent, so no row is skipped after recovery), and
+// a concurrent 410 wins over the cancellation fallout so the engine rebuilds.
+func TestConcurrentFetchCancellationIsNotARowFailure(t *testing.T) {
+	const rows = 12
+	var changes []core.Change
+	for i := range rows {
+		changes = append(changes, core.Change{SyncID: int64(11 + i), Model: "task", ID: strconv.Itoa(i), Action: "U"})
+	}
+	last := int64(10 + rows)
+	delta := func(a int64) (core.Delta, error) {
+		if a >= last {
+			return core.Delta{Metadata: core.Metadata{Last: last, Max: last, Schema: 1}}, nil
+		}
+		return core.Delta{Changes: changes, Metadata: core.Metadata{Last: last, Max: last, Schema: 1}}, nil
+	}
+	outage := true
+	fetch := func(ctx context.Context, r core.Ref) (core.Doc, error) {
+		if outage {
+			if r.ID == "0" {
+				return core.Doc{}, core.ErrUnavailable
+			}
+			// Cancelled by row 0's failure; the timer only keeps a broken
+			// engine from hanging the test.
+			select {
+			case <-ctx.Done():
+			case <-time.After(5 * time.Second):
+			}
+			return core.Doc{}, fmt.Errorf("hk request failed: %w", core.ErrUnavailable)
+		}
+		return core.Doc{Body: "row " + r.ID}, nil
+	}
+	m := newMemory()
+	seed(m)
+	e := core.Engine{Source: ctxSource{source{delta: delta, bootstrap: emptyBootstrap}, fetch}, Store: m, Name: "hk", FetchConcurrency: 4}
+	for range core.RowAttempts + 1 {
+		if err := e.Tick(t.Context(), false); !errors.Is(err, core.ErrUnavailable) {
+			t.Fatalf("outage tick: %v", err)
+		}
+	}
+	outage = false
+	if err := e.Tick(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(m.docs[m.active]); got != rows+1 { // the rows plus seed's document/old
+		t.Fatalf("after recovery %d docs, want %d (a row was skipped)", got, rows+1)
+	}
+
+	// A 410 on one row beats the ErrUnavailable fallout of the rest.
+	rebuilt := false
+	m2 := newMemory()
+	seed(m2)
+	e2 := core.Engine{Source: ctxSource{source{delta: delta, bootstrap: func(string, string) (core.Page, error) {
+		rebuilt = true
+		return core.Page{Max: last, Schema: 1}, nil
+	}}, func(ctx context.Context, r core.Ref) (core.Doc, error) {
+		if r.ID == "1" {
+			return core.Doc{}, core.ErrReset
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+		}
+		return core.Doc{}, fmt.Errorf("hk request failed: %w", core.ErrUnavailable)
+	}}, Store: m2, Name: "hk", FetchConcurrency: 4}
+	_ = e2.Tick(t.Context(), false)
+	if !rebuilt {
+		t.Fatal("a 410 during a concurrent page did not trigger a rebuild")
+	}
+}
+
+// ctxSource is source with a context-aware fetch.
+type ctxSource struct {
+	source
+	fetch func(context.Context, core.Ref) (core.Doc, error)
+}
+
+func (s ctxSource) Fetch(ctx context.Context, _ string, r core.Ref) (core.Doc, error) {
+	return s.fetch(ctx, r)
 }
 
 // A row the index cannot store (CheckDoc) is a row failure: it holds the

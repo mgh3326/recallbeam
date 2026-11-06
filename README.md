@@ -40,6 +40,7 @@ connection details, or wallets into source control. `wallet/` is ignored.
 | `RB_HK_CF_ACCESS_CLIENT_ID`, `RB_HK_CF_ACCESS_CLIENT_SECRET` | Cloudflare Access service token for an `RB_HK_URL` behind Access; set both or neither |
 | `RB_SEARCH_TOKEN` | Search bearer token; required for serve |
 | `RB_LISTEN_ADDR` | HTTP bind address, default IPv4 loopback on port 8080; non-loopback overrides require a protected proxy network |
+| `RB_FETCH_CONCURRENCY` | Row fetches from the source that run at once within one page, default 8, range 1–32 |
 | `RB_SYNC_INTERVAL` | Poll interval as a Go duration; default 15s, range 1s–1h |
 
 The driver enables TLS with certificate verification. Keep the wallet readable
@@ -118,7 +119,9 @@ carrying hk's `deleted` or `not_found` marker removes the indexed row; any
 other 404 means the endpoint is unavailable and never becomes a delete.
 
 Within one delta page, events are coalesced per model and ID: the row's last
-event decides between a delete and one fetch of its current content.
+event decides between a delete and one fetch of its current content. A page's
+rows are fetched `RB_FETCH_CONCURRENCY` at a time and applied in page order; a
+source-wide failure on any row fails the page, as before.
 
 A fetch failure holds the cursor and retries next poll. When the same row
 fails on `RowAttempts` (3) consecutive polls with a row-specific error (for

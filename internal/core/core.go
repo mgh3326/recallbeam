@@ -9,6 +9,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -156,6 +157,10 @@ type Engine struct {
 	// failures counts consecutive failed fetches per model/ID. Tick holds the
 	// writer lock, so access is serialized.
 	failures map[string]int
+	// FetchConcurrency bounds the row fetches of one page that run at once;
+	// 0 or 1 fetches one at a time. Source must then be safe for concurrent
+	// use. Results are still applied in page order.
+	FetchConcurrency int
 	// CheckDoc, when set, rejects a fetched row the index cannot store (for
 	// example a key over its column limit). A rejection is a row-specific
 	// failure: it holds the page and is skipped after RowAttempts, so one
@@ -208,12 +213,19 @@ type skip struct {
 // ErrRowHeld and no mutations. A row skipped because CheckDoc rejects it is
 // also deleted from the index.
 func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, []skip, error) {
+	results, batch := e.fetchAll(ctx, items)
+	if batch != nil {
+		if errors.Is(batch, ErrIncompatible) {
+			log.Printf("sync.row_incompatible err=%q", batch)
+		}
+		return nil, nil, batch
+	}
 	out := make([]Mutation, 0, len(items))
 	var skips []skip
 	var held error
-	for _, it := range items {
+	for i, it := range items {
 		key := it.model + "/" + it.ref.ID
-		d, err := e.Source.Fetch(ctx, it.model, it.ref)
+		d, err := results[i].doc, results[i].err
 		rejected := false
 		if err == nil && e.CheckDoc != nil {
 			c := d
@@ -261,6 +273,82 @@ func (e *Engine) mutations(ctx context.Context, items []fetch) ([]Mutation, []sk
 		return nil, nil, held
 	}
 	return out, skips, nil
+}
+
+type fetched struct {
+	doc Doc
+	err error
+}
+
+// fetchAll fetches every item, at most FetchConcurrency at once, and returns
+// the results in item order. A source-wide failure stops the page: fetches
+// not yet started are not run, and the failure itself is returned as the
+// batch error. Fetches cut short by that cancellation are not row failures,
+// so they never count against a row's attempts. When fetches fail
+// source-wide at the same time, ErrReset wins, so the engine rebuilds.
+func (e *Engine) fetchAll(ctx context.Context, items []fetch) ([]fetched, error) {
+	out := make([]fetched, len(items))
+	n := e.FetchConcurrency
+	if n <= 1 {
+		for i, it := range items {
+			out[i].doc, out[i].err = e.Source.Fetch(ctx, it.model, it.ref)
+			if ctx.Err() != nil {
+				return out, ctx.Err()
+			}
+			if sourceWide(out[i].err) {
+				return out, out[i].err
+			}
+		}
+		return out, nil
+	}
+	child, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var mu sync.Mutex
+	var batch error
+	record := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if batch == nil || (errors.Is(err, ErrReset) && !errors.Is(batch, ErrReset)) {
+			batch = err
+		}
+		cancel()
+	}
+	sem := make(chan struct{}, n)
+	var wg sync.WaitGroup
+	for i, it := range items {
+		select {
+		case sem <- struct{}{}:
+		case <-child.Done():
+		}
+		if child.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		go func(i int, it fetch) {
+			defer func() { <-sem; wg.Done() }()
+			doc, err := e.Source.Fetch(child, it.model, it.ref)
+			// A failure after the page was cancelled is fallout, not a cause.
+			if err != nil && child.Err() != nil {
+				return
+			}
+			out[i].doc, out[i].err = doc, err
+			if sourceWide(err) {
+				record(err)
+			}
+		}(i, it)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return out, ctx.Err()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return out, batch
+}
+
+// sourceWide reports a fetch failure that stops the whole page.
+func sourceWide(err error) bool {
+	return errors.Is(err, ErrReset) || errors.Is(err, ErrUnavailable) || errors.Is(err, ErrIncompatible)
 }
 
 // settle reports the rows that a committed page skipped. A live commit also

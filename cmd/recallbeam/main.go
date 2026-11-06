@@ -88,7 +88,15 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	engine := &core.Engine{Store: st, Source: source, Name: "hk", Generation: generation(), CheckDoc: oracle.CheckDoc}
+	concurrency := 8
+	if v := os.Getenv("RB_FETCH_CONCURRENCY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 32 {
+			return errors.New("invalid RB_FETCH_CONCURRENCY: want 1-32")
+		}
+		concurrency = n
+	}
+	engine := &core.Engine{Store: st, Source: source, Name: "hk", Generation: generation(), FetchConcurrency: concurrency, CheckDoc: oracle.CheckDoc}
 	if mode == "rebuild" {
 		// Attempt counts live in this process, so retry here: a row that keeps
 		// failing is skipped on the last attempt instead of failing every run.
